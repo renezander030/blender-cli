@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.*-cache.json
+*.blend
+*.blend1
+preview*.png
+.DS_Store
