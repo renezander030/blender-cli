@@ -52,7 +52,10 @@ JSON by default; add `-H` for a human-readable view.
 | `exec "<bpy>" [--blend f] [--save f]` | Run agent-authored `bpy`; set keys on `result` and they come back as JSON. |
 | `run <script.py> [--blend f] [--save f]` | Same, from a `.py` file. |
 | `scene [--blend f]` | Dump objects, frame range, materials, and keyframe counts as JSON — the agent's feedback loop. |
-| `render [--blend f] --out preview.png [--frame N] [--res 1280x720]` | Render a preview PNG. |
+| `render [--blend f] --out preview.png [--frame N] [--res 1280x720]` | Render a single preview PNG. |
+| `render --anim --out clip.mp4 [--start N] [--end N] [--fps N] [--res WxH]` | Render the frame range as a **video** (`.mp4`/`.mov`/`.mkv`/`.webm`) or, if `--out` has an image extension, a numbered **PNG sequence**. |
+
+**Video encoding:** uses Blender's own FFmpeg when the build has it; otherwise falls back to rendering a PNG sequence and encoding with your system `ffmpeg` (so it works on FFmpeg-less Blender builds). Image-sequence output needs no `ffmpeg`.
 
 **Environment:** `BLENDER_BIN` overrides the binary path (default `/Applications/Blender.app/Contents/MacOS/Blender`).
 

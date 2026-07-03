@@ -6,9 +6,9 @@
 
 import * as fdn from './foundation.js';
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, existsSync, readFileSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, extname, dirname } from 'node:path';
 
 const DIR = fdn.dirOf(import.meta.url);
 const env = fdn.loadEnv(`${DIR}/.env`);
@@ -160,23 +160,133 @@ result["lights"] = [o.name for o in sc.objects if o.type == "LIGHT"]`;
 };
 
 // `blender-cli render [--blend f.blend] --out preview.png [--frame N]` — preview PNG.
+// `blender-cli render --anim --out clip.mp4` — render the frame range as a video (or,
+// if --out has an image extension, a numbered PNG sequence). --start/--end/--fps override.
+// Video encoding uses Blender's own FFmpeg when the build has it, else falls back to a
+// PNG sequence + system `ffmpeg` (works on FFmpeg-less builds like some dev/CI Blenders).
+const VIDEO_EXTS = ['.mp4', '.mov', '.mkv', '.webm'];
 commands.render = async (args) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'samples', 'res', 'blender']);
+  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'start', 'end', 'fps', 'samples', 'res', 'blender']);
+  const anim = Boolean(flags.anim);
   // Resolve to an absolute path: under --background, Blender resolves a bare
   // relative filepath against its own startup dir (not our cwd) and fails to save.
-  const out = resolve(str(flags.out) || 'preview.png');
-  const body = `sc = bpy.context.scene
-if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
+  const out = resolve(str(flags.out) || (anim ? 'render.mp4' : 'preview.png'));
+  const ext = extname(out).toLowerCase();
+  const wantVideo = anim && VIDEO_EXTS.includes(ext);
+  // Ensure the output directory exists (Blender won't create it, and it lists it
+  // to detect written frames). Covers stills, sequences, and final video output.
+  mkdirSync(dirname(out), { recursive: true });
+  // A temp dir for the PNG sequence when we must encode video externally.
+  const framesDir = wantVideo ? mkdtempSync(join(tmpdir(), 'blcli-frames-')) : null;
+
+  const body = `import os
+sc = bpy.context.scene
+if not any(o.type == "CAMERA" for o in sc.objects):
+    raise RuntimeError("no camera in scene to render from")
 if PARAMS.get("res"):
     w,h = [int(x) for x in str(PARAMS["res"]).lower().split("x")]
     sc.render.resolution_x, sc.render.resolution_y = w, h
-sc.render.image_settings.file_format = "PNG"
-sc.render.filepath = PARAMS["out"]
-if not any(o.type == "CAMERA" for o in sc.objects):
-    raise RuntimeError("no camera in scene to render from")
-bpy.ops.render.render(write_still=True)
-result["rendered"] = PARAMS["out"]`;
-  const r = runBlender(body, { blend: str(flags.blend), params: { out, frame: str(flags.frame) ?? null, res: str(flags.res) || null }, flags });
+if PARAMS.get("fps") is not None:
+    sc.render.fps = int(PARAMS["fps"])
+out = PARAMS["out"]
+if PARAMS.get("anim"):
+    # Animation render: whole frame range (or --start/--end subrange).
+    if PARAMS.get("start") is not None: sc.frame_start = int(PARAMS["start"])
+    if PARAMS.get("end") is not None: sc.frame_end = int(PARAMS["end"])
+    ext = os.path.splitext(out)[1].lower()
+    video = {".mp4": "MPEG4", ".mov": "QUICKTIME", ".mkv": "MKV", ".webm": "WEBM"}
+    is_video = ext in video
+    # FFMPEG is listed in bl_rna even on builds compiled without it; only the runtime
+    # assignment reveals whether this build actually supports video output.
+    has_ffmpeg = False
+    if is_video:
+        try:
+            sc.render.image_settings.file_format = "FFMPEG"
+            has_ffmpeg = True
+        except TypeError:
+            has_ffmpeg = False
+    if is_video and has_ffmpeg:
+        sc.render.ffmpeg.format = video[ext]
+        sc.render.ffmpeg.codec = "WEBM" if ext == ".webm" else "H264"
+        sc.render.filepath = out
+        sc.render.use_file_extension = False
+        outdir = os.path.dirname(out) or "."
+        before = set(os.listdir(outdir))
+        bpy.ops.render.render(animation=True)
+        after = sorted(f for f in os.listdir(outdir) if f not in before)
+        result["mode"] = "video"
+        result["written"] = [os.path.join(outdir, f) for f in after] if after else [out]
+    elif is_video:
+        # No FFmpeg in this Blender build: render a PNG sequence for external encode.
+        fd = PARAMS["frames_dir"]
+        sc.render.image_settings.file_format = "PNG"
+        sc.render.filepath = os.path.join(fd, "frame_")
+        bpy.ops.render.render(animation=True)
+        result["mode"] = "video-needs-encode"
+        result["frames_dir"] = fd
+    else:
+        # Image sequence: --out is a filename prefix; Blender appends zero-padded frame
+        # numbers + extension. Strip a trailing image extension so "shot_.png" -> "shot_0001.png".
+        sc.render.image_settings.file_format = "PNG"
+        prefix = out
+        for e in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".exr", ".bmp"):
+            if prefix.lower().endswith(e):
+                prefix = prefix[:-len(e)]
+                break
+        sc.render.filepath = prefix
+        outdir = os.path.dirname(out) or "."
+        before = set(os.listdir(outdir))
+        bpy.ops.render.render(animation=True)
+        after = sorted(f for f in os.listdir(outdir) if f not in before)
+        result["mode"] = "sequence"
+        result["written"] = [os.path.join(outdir, f) for f in after]
+    result["frames"] = [sc.frame_start, sc.frame_end]
+    result["fps"] = sc.render.fps
+else:
+    if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
+    sc.render.image_settings.file_format = "PNG"
+    sc.render.filepath = out
+    bpy.ops.render.render(write_still=True)
+    result["rendered"] = out`;
+
+  const r = runBlender(body, { blend: str(flags.blend), params: {
+    out, anim,
+    frame: str(flags.frame) ?? null,
+    start: str(flags.start) ?? null,
+    end: str(flags.end) ?? null,
+    fps: str(flags.fps) ?? null,
+    res: str(flags.res) || null,
+    frames_dir: framesDir,
+  }, flags });
+
+  // Fallback path: Blender rendered PNGs, we encode the video with system ffmpeg.
+  if (r.ok && (r.result as Record<string, unknown>)?.mode === 'video-needs-encode' && framesDir) {
+    const res = r.result as Record<string, unknown>;
+    const fps = Number(res.fps) || 24;
+    const codec = ext === '.webm'
+      ? ['-c:v', 'libvpx-vp9', '-b:v', '0', '-crf', '30']
+      : ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
+    const ff = spawnSync('ffmpeg', [
+      '-y', '-framerate', String(fps),
+      '-pattern_type', 'glob', '-i', join(framesDir, 'frame_*.png'),
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      ...codec, out,
+    ], { encoding: 'utf8' });
+    rmSync(framesDir, { recursive: true, force: true });
+    if (ff.error || ff.status !== 0) {
+      fdn.out({ ok: false, error: 'video encode failed', hint: ff.error
+        ? 'this Blender build has no FFmpeg and no system `ffmpeg` was found on PATH — render an image sequence instead (--out frames/shot_.png)'
+        : (ff.stderr || '').slice(-600) });
+      process.exit(1);
+    }
+    delete res.frames_dir;
+    res.mode = 'video';
+    res.written = [out];
+    res.encoder = 'system ffmpeg';
+  } else if (framesDir) {
+    rmSync(framesDir, { recursive: true, force: true });
+  }
+
   fdn.out(r); if (!r.ok) process.exit(1);
 };
 
@@ -212,7 +322,8 @@ Usage: blender-cli <command> [args] [--blender <path>] [--human]
   exec "<bpy>"  [--blend f] [--save f]   run agent-authored bpy; set result[...] keys -> JSON back
   run <script.py> [--blend f] [--save f] same, from a .py file
   scene [--blend f]            dump objects / frame range / materials / keyframe counts as JSON
-  render [--blend f] --out preview.png [--frame N] [--res 1280x720]
+  render [--blend f] --out preview.png [--frame N] [--res 1280x720]   single still
+  render --anim --out clip.mp4 [--start N] [--end N] [--fps N] [--res WxH]   animation (.mp4/.mov/.mkv/.webm = video; else PNG sequence)
 
 Env: BLENDER_BIN overrides the binary path (default /Applications/Blender.app/Contents/MacOS/Blender).
 The agent writes bpy for building/animating; the CLI just runs it deterministically and reports state.`);
