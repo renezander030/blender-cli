@@ -14,6 +14,17 @@
 
 The division of labour: **your agent writes the `bpy`** (translating "make it bounce and spin over 2 seconds" into keyframes); **the CLI runs it deterministically and reports scene state back** so the agent can verify and iterate.
 
+## Why a CLI, not an MCP server?
+
+**You don't need an MCP server (or a Blender add-on) to give an agent Blender — a CLI is lighter.**
+
+- **No server, no daemon, no socket** to start, supervise, or reconnect — nothing left running. Each call spawns `Blender --background`, does its work, and exits.
+- **No add-on** to install into Blender or enable per version.
+- **Works with any agent that can run a shell command** — Claude Code, Codex, a plain script, cron — not only MCP clients.
+- **Zero runtime dependencies** — just `Blender` and Node ≥ 18.
+
+If you already speak MCP, fine — but for driving Blender headless, a shell command is the smaller, more portable surface.
+
 ## Requirements
 
 - [Blender](https://www.blender.org/download/) installed locally (macOS default path is auto-detected; override with `BLENDER_BIN` or `--blender <path>`)
