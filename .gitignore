@@ -1,8 +1,16 @@
 node_modules/
 dist/
+__pycache__/
+*.pyc
 .env
 .*-cache.json
 *.blend
 *.blend1
 preview*.png
+# rendered timeline output / scratch media (never commit clips or source images)
+*.mp4
+*.mov
+examples/**/*.jpg
+examples/**/*.jpeg
+examples/**/*.png
 .DS_Store

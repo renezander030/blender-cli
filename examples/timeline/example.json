@@ -1,0 +1,10 @@
+{
+  "id": "collapse",
+  "title": "THE COLLAPSE — 1250 → 1175 BC",
+  "durationSec": 5,
+  "events": [
+    {"id": "drought", "date": "1250 BC", "label": "Drought begins", "axisU": 0.10, "emphasize": false},
+    {"id": "burn", "date": "1200 BC", "label": "Cities burn", "axisU": 0.50, "emphasize": false},
+    {"id": "hekla", "date": "1159 BC", "label": "Hekla 3 erupts", "axisU": 0.92, "emphasize": true}
+  ]
+}
