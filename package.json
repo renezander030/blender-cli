@@ -1,6 +1,6 @@
 {
   "name": "blender-cli",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Drive Blender headless from your agent: scaffold, build, animate from natural language. JSON in, JSON out.",
   "type": "module",
   "bin": {
@@ -9,11 +9,12 @@
   "files": [
     "blender-cli",
     "foundation.js",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["blender", "cli", "bpy", "agent", "llm", "headless", "automation", "3d", "animation"],
+  "keywords": ["blender", "cli", "bpy", "agent", "llm", "headless", "automation", "3d", "animation", "gltf", "render", "mcp-alternative"],
   "license": "MIT"
 }

@@ -1,0 +1,32 @@
+<svg width="760" height="170" viewBox="0 0 760 170" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="blender-cli — Blender, driven by your agent">
+  <!-- Original mark for blender-cli. Not affiliated with the Blender Foundation;
+       intentionally distinct from the Blender logo, which is a registered trademark. -->
+  <rect x="1" y="1" width="758" height="168" rx="18" fill="#FAF6EF" stroke="#E7DFD2" stroke-width="2"/>
+
+  <!-- isometric wireframe cube, one face "rendered" -->
+  <g stroke="#0D9488" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
+    <!-- right face (rendered fill) -->
+    <path d="M85 85 L126 61 L126 109 L85 133 Z" fill="#0D9488" fill-opacity="0.18"/>
+    <!-- top face -->
+    <path d="M44 61 L85 37 L126 61 L85 85 Z" fill="#0D9488" fill-opacity="0.07"/>
+    <!-- left face -->
+    <path d="M44 61 L85 85 L85 133 L44 109 Z" fill="none"/>
+  </g>
+  <!-- vertex dots -->
+  <g fill="#0F766E">
+    <circle cx="85" cy="37" r="3.2"/><circle cx="126" cy="61" r="3.2"/>
+    <circle cx="126" cy="109" r="3.2"/><circle cx="85" cy="133" r="3.2"/>
+    <circle cx="44" cy="109" r="3.2"/><circle cx="44" cy="61" r="3.2"/>
+    <circle cx="85" cy="85" r="3.2"/>
+  </g>
+  <!-- JSON hint on the rendered face -->
+  <text x="105" y="102" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#0F766E" text-anchor="middle">{&#8201;}</text>
+  <!-- terminal caret under the cube -->
+  <text x="44" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" fill="#B45309">&#9656;</text>
+  <rect x="58" y="145" width="9" height="13" fill="#B45309" opacity="0.85"/>
+
+  <!-- wordmark -->
+  <text x="168" y="82" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="44" font-weight="700" fill="#1F2937">blender-cli</text>
+  <text x="170" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#57534E">Blender, driven by your agent.</text>
+  <text x="170" y="142" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#0D9488">JSON in &#8594; bpy runs headless &#8594; JSON out</text>
+</svg>

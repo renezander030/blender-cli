@@ -1,58 +1,113 @@
 #!/usr/bin/env node
 // blender-cli — Drive Blender headless from your agent: scaffold, build, animate from natural language.
-// Agent-first CLI: JSON output by default, -H/--human for a table.
+// Agent-first CLI: JSON output by default, -H/--human for a pretty-printed view.
 // The CLI is a deterministic headless executor + inspector; your agent writes the bpy.
 // Built on cli-foundation (see foundation.js for the primitives used here).
 
 import * as fdn from './foundation.js';
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, existsSync, readFileSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { writeFileSync, existsSync, readFileSync, mkdtempSync, readdirSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 const DIR = fdn.dirOf(import.meta.url);
 const env = fdn.loadEnv(`${DIR}/.env`);
+const PKG = JSON.parse(readFileSync(join(DIR, 'package.json'), 'utf8'));
 
-// --- Locate the Blender binary (macOS-first, overridable) -------------------
-function blenderBin(flags = {}) {
-  const candidates = [
-    flags.blender,
-    env.BLENDER_BIN,
-    process.env.BLENDER_BIN,
+// Consistent output: terse JSON line by default, pretty JSON with -H/--human.
+const show = (r, ctx) => fdn.emit(r, { human: ctx?.human, table: () => JSON.stringify(r, null, 2) });
+
+// --- Locate the Blender binary (cross-platform, overridable) -----------------
+function platformCandidates() {
+  const home = homedir();
+  const mac = [
     '/Applications/Blender.app/Contents/MacOS/Blender',
-    'blender',
-  ].filter(Boolean);
-  for (const c of candidates) {
-    if (c === 'blender') return c;                 // rely on PATH
-    if (existsSync(c)) return c;
+    join(home, 'Applications/Blender.app/Contents/MacOS/Blender'),
+  ];
+  const linux = [
+    '/usr/bin/blender', '/usr/local/bin/blender', '/snap/bin/blender',
+    '/var/lib/flatpak/exports/bin/org.blender.Blender', join(home, '.local/bin/blender'),
+  ];
+  const win = [];
+  if (process.platform === 'win32') {
+    for (const pf of [process.env['ProgramFiles'], process.env['ProgramFiles(x86)']].filter(Boolean)) {
+      const base = join(pf, 'Blender Foundation');
+      try {
+        for (const d of readdirSync(base).sort().reverse()) win.push(join(base, d, 'blender.exe'));
+      } catch { /* not installed there */ }
+    }
+    return win;
   }
-  return '/Applications/Blender.app/Contents/MacOS/Blender'; // best guess for error msg
+  return process.platform === 'darwin' ? [...mac, ...linux] : [...linux, ...mac];
 }
 
+// An explicit pin (--blender / BLENDER_BIN) is used as-is: a typo'd pin must
+// fail loudly, never silently fall through to a different Blender install.
+function blenderBinInfo(flags = {}) {
+  const pinned = flags.blender || env.BLENDER_BIN || process.env.BLENDER_BIN;
+  if (pinned) return { bin: pinned, tried: [pinned] };
+  const tried = platformCandidates();
+  for (const c of tried) if (existsSync(c)) return { bin: c, tried };
+  return { bin: 'blender', tried: [...tried, 'blender (PATH)'] }; // last resort: let PATH resolve it
+}
+const blenderBin = (flags) => blenderBinInfo(flags).bin;
+
 // --- The deterministic boundary: run a bpy body headless, get JSON back -----
-// Wraps the body so it can read PARAMS, mutate `result`, and always emits a
-// single sentinel JSON line we can parse out of Blender's noisy stdout.
+// The body goes to its own file and is exec()'d verbatim (no reindenting, so
+// multi-line string literals survive untouched). The wrapper gives it PARAMS
+// and `result`, captures print() output as `logs`, and emits ONE sentinel line
+// with the JSON base64-armored: agent output can never collide with the
+// delimiters, and NaN/Infinity floats are stringified instead of breaking parse.
 const SENTINEL_A = '__BLENDER_CLI__';
 const SENTINEL_B = '__END__';
 
 function runBlender(body, { blend, save, params = {}, flags = {} } = {}) {
   const bin = blenderBin(flags);
+  let timeoutMs = 0;
+  if (flags.timeout !== undefined) {
+    const t = Number(flags.timeout);
+    if (flags.timeout === true || !Number.isFinite(t) || t <= 0) {
+      return { ok: false, error: `invalid --timeout: ${flags.timeout} (whole seconds, e.g. --timeout 120)` };
+    }
+    timeoutMs = t * 1000;
+  }
   const dir = mkdtempSync(join(tmpdir(), 'blender-cli-'));
   const script = join(dir, 'run.py');
+  const bodyFile = join(dir, 'body.py');
+  writeFileSync(bodyFile, body);
   if (save) params.__save__ = save;
-  const wrapper = `import bpy, json, sys, traceback
+  params.__body__ = bodyFile;
+  const wrapper = `import bpy, json, sys, os, time, traceback, io, contextlib, base64, math
+def _clean(o):
+    if isinstance(o, float) and not math.isfinite(o): return repr(o)
+    if isinstance(o, dict): return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)): return [_clean(v) for v in o]
+    return o
 def emit(obj):
-    sys.stdout.write("\\n${SENTINEL_A}" + json.dumps(obj) + "${SENTINEL_B}\\n"); sys.stdout.flush()
+    try:
+        s = json.dumps(obj, allow_nan=False)
+    except ValueError:
+        s = json.dumps(_clean(obj), allow_nan=False)
+    sys.stdout.write("\\n${SENTINEL_A}" + base64.b64encode(s.encode("utf-8")).decode("ascii") + "${SENTINEL_B}\\n")
+    sys.stdout.flush()
 PARAMS = json.loads(${JSON.stringify(JSON.stringify(params))})
 result = {}
+_buf = io.StringIO(); _t0 = time.time()
+def _finish(payload):
+    logs = _buf.getvalue().strip()
+    if logs: payload["logs"] = logs[-2000:]
+    emit(payload)
 try:
-${body.split('\n').map(l => '    ' + l).join('\n')}
+    with open(PARAMS["__body__"], encoding="utf-8") as _f:
+        _code = compile(_f.read(), "<agent-bpy>", "exec")
+    with contextlib.redirect_stdout(_buf):
+        exec(_code, globals())
     if PARAMS.get("__save__"):
         bpy.ops.wm.save_as_mainfile(filepath=PARAMS["__save__"])
         result.setdefault("saved", PARAMS["__save__"])
-    emit({"ok": True, "result": result})
+    _finish({"ok": True, "result": result, "ms": int((time.time() - _t0) * 1000)})
 except Exception as e:
-    emit({"ok": False, "error": str(e), "trace": traceback.format_exc()})
+    _finish({"ok": False, "error": str(e), "trace": traceback.format_exc()})
     sys.exit(1)
 `;
   writeFileSync(script, wrapper);
@@ -61,51 +116,130 @@ except Exception as e:
   if (blend) { if (!existsSync(blend)) return { ok: false, error: `blend not found: ${blend}` }; args.push(blend); }
   args.push('--python', script, '--python-exit-code', '1');
 
-  const r = spawnSync(bin, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync(bin, args, {
+    encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+    ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
+  });
+  if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, error: `Blender timed out after ${timeoutMs / 1000}s (killed)`, timed_out: true, bin };
   if (r.error) return { ok: false, error: `cannot run Blender (${bin}): ${r.error.message}`, bin };
   const out = r.stdout || '';
-  const m = out.match(new RegExp(SENTINEL_A + '([\\s\\S]*?)' + SENTINEL_B));
+  const m = out.match(new RegExp(SENTINEL_A + '([A-Za-z0-9+/=]+)' + SENTINEL_B));
   if (!m) return { ok: false, error: 'no result from Blender (script may have crashed before emit)', exit: r.status, stderr_tail: (r.stderr || '').slice(-800), stdout_tail: out.slice(-800), bin };
-  try { return JSON.parse(m[1]); } catch (e) { return { ok: false, error: 'bad JSON from Blender', raw: m[1].slice(0, 800) }; }
+  try { return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')); } catch (e) { return { ok: false, error: 'bad JSON from Blender', raw: m[1].slice(0, 800) }; }
 }
 
 const commands = {};
 
-// `blender-cli doctor` — find Blender, confirm headless bpy works, report version.
-commands.doctor = async (args) => {
-  const { flags } = fdn.parseArgs(args, ['blender']);
-  const bin = blenderBin(flags);
+// `blender-cli doctor` — find Blender, confirm headless bpy works, report
+// version verdict, importers/exporters, video support, and GPU render devices.
+const TESTED_VERSIONS = ['4.3'];
+commands.doctor = async (args, ctx) => {
+  const { flags } = fdn.parseArgs(args, ['blender', 'timeout']);
+  const { bin, tried } = blenderBinInfo(flags);
   const ver = spawnSync(bin, ['--version'], { encoding: 'utf8' });
-  if (ver.error) { fdn.out({ ok: false, blender_bin: bin, error: `not found/executable: ${ver.error.message}`, hint: 'set BLENDER_BIN or pass --blender <path>' }); process.exit(1); }
+  if (ver.error) {
+    show({ ok: false, blender_bin: bin, error: `not found/executable: ${ver.error.message}`, searched: tried, hint: 'set BLENDER_BIN or pass --blender <path>' }, ctx);
+    process.exit(1);
+  }
   const versionLine = (ver.stdout || '').split('\n')[0].trim();
-  const probe = runBlender('result["bpy_version"] = list(bpy.app.version)\nresult["build"] = bpy.app.version_string', { flags });
-  fdn.out({ ok: probe.ok === true, blender_bin: bin, version: versionLine, bpy: probe.result || null, headless_ok: probe.ok === true, error: probe.error || undefined });
+  const probe = runBlender(`result["bpy_version"] = list(bpy.app.version)
+result["build"] = bpy.app.version_string
+result["python"] = sys.version.split()[0]
+imp = dir(bpy.ops.wm); scn = dir(bpy.ops.import_scene)
+result["formats"] = {
+    "gltf": "gltf" in scn, "fbx": "fbx" in scn,
+    "obj": "obj_import" in imp or "obj" in scn,
+    "stl": "stl_import" in imp or "stl" in dir(bpy.ops.import_mesh),
+    "ply": "ply_import" in imp or "ply" in dir(bpy.ops.import_mesh),
+    "usd": "usd_import" in imp, "alembic": "alembic_import" in imp, "collada": "collada_import" in imp}
+result["video_ffmpeg"] = "FFMPEG" in [i.identifier for i in bpy.types.ImageFormatSettings.bl_rna.properties["file_format"].enum_items]
+result["engines"] = [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items]
+devs = []
+try:
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    for t in ("CUDA", "OPTIX", "HIP", "METAL", "ONEAPI"):
+        try:
+            for d in (prefs.get_devices_for_type(t) or []):
+                if getattr(d, "type", "") == t: devs.append({"type": t, "name": d.name})
+        except Exception:
+            pass
+except Exception:
+    pass
+result["gpu_devices"] = devs`, { flags });
+  const v = probe.ok ? probe.result.bpy_version : null;
+  const verdict = !v ? null
+    : (v[0] === 4 && v[1] >= 2) || v[0] >= 5 ? `supported (tested on ${TESTED_VERSIONS.join(', ')})`
+    : v[0] >= 3 ? 'expected to work (not in the tested matrix; legacy import/export operators are used automatically where needed)'
+    : 'unsupported (needs Blender 3.0+)';
+  show({
+    ok: probe.ok === true, blender_bin: bin, version: versionLine,
+    platform: process.platform, headless_ok: probe.ok === true,
+    support: verdict, ...(probe.result || {}), error: probe.error || undefined,
+  }, ctx);
+  if (!probe.ok) process.exit(1);
 };
 
 // `blender-cli exec "<bpy>"` | `blender-cli run <script.py>` — agent-authored bpy.
 // The agent writes bpy; set keys on `result` and they come back as JSON.
-async function execBody(body, args) {
-  const { flags } = fdn.parseArgs(args, ['blend', 'save', 'blender']);
+// --check compiles the code and flags risky calls WITHOUT executing anything
+// (ok:false + exit 1 when the code does not compile — same contract as everywhere).
+// --timeout <sec> kills a hung Blender instead of hanging the agent.
+const EXEC_FLAGS = ['blend', 'save', 'blender', 'timeout'];
+const EXEC_USAGE = 'blender-cli exec "<bpy code>" [--blend f.blend] [--save out.blend] [--check] [--timeout sec]';
+async function execBody(body, args, ctx) {
+  const { flags } = fdn.parseArgs(args, EXEC_FLAGS);
+  if (flags.check) {
+    const checker = `import re
+code = PARAMS["__code__"]
+try:
+    compile(code, "<agent-bpy>", "exec")
+    result["compiles"] = True
+except SyntaxError as e:
+    result["compiles"] = False
+    result["syntax_error"] = {"line": e.lineno, "msg": e.msg, "text": (e.text or "").strip()}
+RISKY = [
+    (r"\\bos\\.system", "os.system", "shell command"),
+    (r"\\bsubprocess\\b", "subprocess", "subprocess spawn"),
+    (r"\\bshutil\\.rmtree", "shutil.rmtree", "recursive delete"),
+    (r"\\bos\\.(remove|unlink|rmdir)\\b", "os.remove/unlink/rmdir", "file delete"),
+    (r"\\beval\\s*\\(", "eval()", "dynamic eval"),
+    (r"\\bexec\\s*\\(", "exec()", "dynamic exec"),
+    (r"\\b__import__\\b", "__import__", "dynamic import"),
+    (r"^\\s*(import|from)\\s+socket\\b|\\bsocket\\.socket\\b", "socket", "network access"),
+    (r"^\\s*(import|from)\\s+urllib\\b|\\burllib\\.request\\b", "urllib", "network access"),
+    (r"^\\s*(import|from)\\s+requests\\b|\\brequests\\.(get|post|put|delete)\\b", "requests", "network access"),
+    (r"\\bhttp\\.client\\b", "http.client", "network access"),
+    (r"\\bsys\\.exit\\b", "sys.exit", "interpreter exit"),
+]
+result["warnings"] = [{"call": name, "risk": why} for pat, name, why in RISKY if re.search(pat, code, re.M)]
+result["checked_only"] = True`;
+    const r = runBlender(checker, { params: { __code__: body }, flags });
+    if (r.ok && r.result && r.result.compiles === false) { r.ok = false; r.error = 'agent code does not compile'; }
+    show(r, ctx); if (!r.ok) process.exit(1);
+    return;
+  }
   const r = runBlender(body, { blend: flags.blend, save: flags.save, flags });
-  fdn.out(r); if (!r.ok) process.exit(1);
+  show(r, ctx); if (!r.ok) process.exit(1);
 }
-commands.exec = async (args) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender']);
-  if (!positional.length) { console.error('usage: blender-cli exec "<bpy code>" [--blend f.blend] [--save out.blend]'); process.exit(1); }
-  await execBody(positional.join(' '), args);
+commands.exec = async (args, ctx) => {
+  const { positional } = fdn.parseArgs(args, EXEC_FLAGS);
+  if (!positional.length) { show({ ok: false, error: 'missing bpy code', usage: EXEC_USAGE }, ctx); process.exit(1); }
+  await execBody(positional.join(' '), args, ctx);
 };
-commands.run = async (args) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender']);
+commands.run = async (args, ctx) => {
+  const { positional } = fdn.parseArgs(args, EXEC_FLAGS);
   const file = positional[0];
-  if (!file || !existsSync(file)) { console.error(`script not found: ${file}`); process.exit(1); }
-  await execBody(readFileSync(file, 'utf8'), args);
+  if (!file || !existsSync(file)) { show({ ok: false, error: `script not found: ${file || '(none given)'}`, usage: 'blender-cli run <script.py> [--blend f.blend] [--save out.blend] [--check] [--timeout sec]' }, ctx); process.exit(1); }
+  await execBody(readFileSync(file, 'utf8'), args, ctx);
 };
 
 // `blender-cli scene [--blend f.blend]` — dump scene state as JSON (the feedback loop).
-commands.scene = async (args) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'blender']);
+commands.scene = async (args, ctx) => {
+  const { flags } = fdn.parseArgs(args, ['blend', 'blender', 'timeout']);
   const body = `sc = bpy.context.scene
 result["scene"] = sc.name
+result["engine"] = sc.render.engine
+result["resolution"] = [sc.render.resolution_x, sc.render.resolution_y]
 result["frame_range"] = [sc.frame_start, sc.frame_end, sc.frame_current]
 result["fps"] = sc.render.fps
 result["objects"] = [
@@ -119,35 +253,191 @@ result["materials"] = [m.name for m in bpy.data.materials]
 result["cameras"] = [o.name for o in sc.objects if o.type == "CAMERA"]
 result["lights"] = [o.name for o in sc.objects if o.type == "LIGHT"]`;
   const r = runBlender(body, { blend: flags.blend, flags });
-  fdn.emit(r.ok ? r.result : r, {
-    human: fdn.parseArgs(args, []).flags.human,
-    table: () => JSON.stringify(r.result || r, null, 2),
-  });
+  show(r, ctx);
   if (!r.ok) process.exit(1);
 };
 
-// `blender-cli render [--blend f.blend] --out preview.png [--frame N]` — preview PNG.
-commands.render = async (args) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'samples', 'res', 'blender']);
-  const out = flags.out || join(process.cwd(), 'preview.png');
-  const body = `sc = bpy.context.scene
-if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
+// Shared render setup: engine / device / samples / resolution as bpy, from PARAMS.
+const RENDER_SETUP = `sc = bpy.context.scene
+eng = (PARAMS.get("engine") or "").lower()
+if eng:
+    emap = {"cycles": "CYCLES", "eevee": "BLENDER_EEVEE_NEXT", "workbench": "BLENDER_WORKBENCH"}
+    if eng not in emap: raise RuntimeError("unknown engine: " + eng + " (use cycles|eevee|workbench)")
+    target = emap[eng]
+    if target == "BLENDER_EEVEE_NEXT" and bpy.app.version < (4, 2, 0): target = "BLENDER_EEVEE"
+    sc.render.engine = target
+dev = (PARAMS.get("device") or "").upper()
+if dev:
+    if sc.render.engine != "CYCLES": raise RuntimeError("--device needs --engine cycles (got " + sc.render.engine + ")")
+    if dev == "CPU":
+        sc.cycles.device = "CPU"
+    else:
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+        prefs.compute_device_type = dev
+        devs = list(prefs.get_devices_for_type(dev) or [])
+        if not [d for d in devs if getattr(d, "type", "") == dev]:
+            raise RuntimeError("no " + dev + " device available (run doctor to list gpu_devices)")
+        for d in devs: d.use = True
+        sc.cycles.device = "GPU"
+if PARAMS.get("samples") is not None:
+    s = int(PARAMS["samples"])
+    if sc.render.engine == "CYCLES": sc.cycles.samples = s
+    elif "EEVEE" in sc.render.engine: sc.eevee.taa_render_samples = s
+if PARAMS.get("denoise") is not None and sc.render.engine == "CYCLES":
+    sc.cycles.use_denoising = str(PARAMS["denoise"]).lower() not in ("off", "false", "0", "no")
 if PARAMS.get("res"):
-    w,h = [int(x) for x in str(PARAMS["res"]).lower().split("x")]
+    w, h = [int(x) for x in str(PARAMS["res"]).lower().split("x")]
     sc.render.resolution_x, sc.render.resolution_y = w, h
-sc.render.image_settings.file_format = "PNG"
-sc.render.filepath = PARAMS["out"]
+if PARAMS.get("fps"): sc.render.fps = int(PARAMS["fps"])
+if PARAMS.get("frames"):
+    parts = [p for p in str(PARAMS["frames"]).replace("..", ":").split(":") if p != ""]
+    a = int(parts[0]); b = int(parts[1]) if len(parts) > 1 else a
+    sc.frame_start, sc.frame_end = a, b
+def _meta(result, sc):
+    result["engine"] = sc.render.engine
+    result["resolution"] = [sc.render.resolution_x, sc.render.resolution_y]
+    if sc.render.engine == "CYCLES": result["samples"] = sc.cycles.samples
+    elif "EEVEE" in sc.render.engine: result["samples"] = sc.eevee.taa_render_samples`;
+
+// `blender-cli render [--blend f] --out preview.png` — single-frame preview,
+// or `--animation` for the whole frame range as MP4 (via Blender's ffmpeg) or a
+// PNG sequence. Result JSON carries engine/resolution/samples/duration/bytes so
+// the agent can verify the render without a second round-trip.
+commands.render = async (args, ctx) => {
+  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'frames', 'fps', 'samples', 'res', 'engine', 'device', 'denoise', 'blender', 'timeout']);
+  const animation = !!flags.animation;
+  const out = resolve(flags.out || join(process.cwd(), animation ? 'preview.mp4' : 'preview.png'));
+  const params = {
+    out, frame: flags.frame ?? null, frames: flags.frames || null, fps: flags.fps ?? null,
+    res: flags.res || null, engine: flags.engine || null, device: flags.device || null,
+    samples: flags.samples ?? null, denoise: flags.denoise ?? null,
+  };
+  const still = `${RENDER_SETUP}
+if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
 if not any(o.type == "CAMERA" for o in sc.objects):
     raise RuntimeError("no camera in scene to render from")
+out = PARAMS["out"]
+base = os.path.basename(out)
+ext = base.rsplit(".", 1)[-1].lower() if "." in base else ""
+fmt = {"png": "PNG", "jpg": "JPEG", "jpeg": "JPEG", "exr": "OPEN_EXR", "tif": "TIFF", "tiff": "TIFF", "bmp": "BMP", "webp": "WEBP"}.get(ext)
+if fmt is None:
+    out = out + ".png"; fmt = "PNG"
+sc.render.image_settings.file_format = fmt
+sc.render.use_file_extension = False
+sc.render.filepath = out
+os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+_t = time.time()
 bpy.ops.render.render(write_still=True)
-result["rendered"] = PARAMS["out"]`;
-  const r = runBlender(body, { blend: flags.blend, params: { out, frame: flags.frame ?? null, res: flags.res || null }, flags });
-  fdn.out(r); if (!r.ok) process.exit(1);
+result["rendered"] = out
+result["frame"] = sc.frame_current
+result["duration_ms"] = int((time.time() - _t) * 1000)
+result["bytes"] = os.path.getsize(out)
+_meta(result, sc)`;
+  const anim = `${RENDER_SETUP}
+import glob as _glob
+if not any(o.type == "CAMERA" for o in sc.objects):
+    raise RuntimeError("no camera in scene to render from")
+out = PARAMS["out"]
+d = os.path.dirname(out) or "."
+os.makedirs(d, exist_ok=True)
+video = out.lower().endswith((".mp4", ".mov", ".webm"))
+if video:
+    fmts = [i.identifier for i in bpy.types.ImageFormatSettings.bl_rna.properties["file_format"].enum_items]
+    if "FFMPEG" not in fmts: raise RuntimeError("this Blender build has no FFMPEG video support; render a PNG sequence instead (--out frames/)")
+    sc.render.image_settings.file_format = "FFMPEG"
+    sc.render.ffmpeg.format = {"mp4": "MPEG4", "mov": "QUICKTIME", "webm": "WEBM"}[out.rsplit(".", 1)[-1].lower()]
+    sc.render.ffmpeg.codec = "WEBM" if sc.render.ffmpeg.format == "WEBM" else "H264"
+    stem = os.path.join(d, "__bcli_anim__")
+    for f in _glob.glob(_glob.escape(stem) + "*"): os.remove(f)
+    sc.render.filepath = stem
+    _t = time.time()
+    bpy.ops.render.render(animation=True)
+    produced = sorted(_glob.glob(_glob.escape(stem) + "*"))
+    if not produced: raise RuntimeError("no video produced")
+    os.replace(produced[0], out)
+    result["rendered"] = out
+    result["bytes"] = os.path.getsize(out)
+else:
+    prefix = out[:-4] + "_" if out.lower().endswith(".png") else os.path.join(out, "frame_")
+    os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
+    for f in _glob.glob(_glob.escape(prefix) + "*"): os.remove(f)
+    sc.render.image_settings.file_format = "PNG"
+    sc.render.filepath = prefix
+    _t = time.time()
+    bpy.ops.render.render(animation=True)
+    files = sorted(_glob.glob(_glob.escape(prefix) + "*"))
+    if not files: raise RuntimeError("no frames produced")
+    result["rendered"] = prefix + "####.png"
+    result["files"] = [files[0], files[-1]]
+    result["frame_files"] = len(files)
+    result["bytes"] = sum(os.path.getsize(f) for f in files)
+result["frames"] = [sc.frame_start, sc.frame_end]
+result["frame_count"] = sc.frame_end - sc.frame_start + 1
+result["fps"] = sc.render.fps
+result["duration_ms"] = int((time.time() - _t) * 1000)
+_meta(result, sc)`;
+  const r = runBlender(animation ? anim : still, { blend: flags.blend, params, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// `blender-cli import <file>` — pull an asset into the scene (ML output, scans,
+// downloads): glTF/GLB, OBJ, FBX, STL, PLY, USD, Alembic, Collada. Reports what
+// arrived so the agent can verify. Legacy operators are used below Blender 4.x.
+commands.import = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender', 'timeout']);
+  const file = positional[0];
+  if (!file || !existsSync(file)) {
+    show({ ok: false, error: `asset file not found: ${file || '(none given)'}`, usage: 'blender-cli import <asset-file> [--blend f] [--save f]' }, ctx);
+    process.exit(1);
+  }
+  const body = `p = PARAMS["file"]; ext = p.lower().rsplit(".", 1)[-1]
+before = set(o.name for o in bpy.data.objects)
+wm = dir(bpy.ops.wm)
+if ext in ("glb", "gltf"): bpy.ops.import_scene.gltf(filepath=p)
+elif ext == "obj": (bpy.ops.wm.obj_import(filepath=p) if "obj_import" in wm else bpy.ops.import_scene.obj(filepath=p))
+elif ext == "fbx": bpy.ops.import_scene.fbx(filepath=p)
+elif ext == "stl": (bpy.ops.wm.stl_import(filepath=p) if "stl_import" in wm else bpy.ops.import_mesh.stl(filepath=p))
+elif ext == "ply": (bpy.ops.wm.ply_import(filepath=p) if "ply_import" in wm else bpy.ops.import_mesh.ply(filepath=p))
+elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_import(filepath=p)
+elif ext == "abc": bpy.ops.wm.alembic_import(filepath=p)
+elif ext == "dae": bpy.ops.wm.collada_import(filepath=p)
+else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz abc dae)")
+added = [o for o in bpy.data.objects if o.name not in before]
+result["imported"] = {"file": p, "format": ext, "objects": [{"name": o.name, "type": o.type} for o in added],
+    "count": len(added), "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH")}`;
+  const r = runBlender(body, { blend: flags.blend, save: flags.save, params: { file: resolve(file) }, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// `blender-cli export <out>` — hand the scene to the next tool in the pipeline:
+// glTF/GLB, OBJ, FBX, STL, PLY, USD. Format from the extension.
+commands.export = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'blender', 'timeout']);
+  const outArg = positional[0];
+  if (!outArg) {
+    show({ ok: false, error: 'missing output path', usage: 'blender-cli export <out.glb|obj|fbx|stl|ply|usd> [--blend f] [--selected]' }, ctx);
+    process.exit(1);
+  }
+  const body = `p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
+sel = bool(PARAMS.get("selected"))
+os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+wm = dir(bpy.ops.wm)
+if ext in ("glb", "gltf"): bpy.ops.export_scene.gltf(filepath=p, export_format=("GLB" if ext == "glb" else "GLTF_SEPARATE"), use_selection=sel)
+elif ext == "obj": (bpy.ops.wm.obj_export(filepath=p, export_selected_objects=sel) if "obj_export" in wm else bpy.ops.export_scene.obj(filepath=p, use_selection=sel))
+elif ext == "fbx": bpy.ops.export_scene.fbx(filepath=p, use_selection=sel)
+elif ext == "stl": (bpy.ops.wm.stl_export(filepath=p, export_selected_objects=sel) if "stl_export" in wm else bpy.ops.export_mesh.stl(filepath=p, use_selection=sel))
+elif ext == "ply": (bpy.ops.wm.ply_export(filepath=p, export_selected_objects=sel) if "ply_export" in wm else bpy.ops.export_mesh.ply(filepath=p, use_selection=sel))
+elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_export(filepath=p, selected_objects_only=sel)
+else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz)")
+result["exported"] = {"file": p, "format": ext, "bytes": os.path.getsize(p),
+    "objects": len([o for o in bpy.context.scene.objects if not sel or o.select_get()])}`;
+  const r = runBlender(body, { blend: flags.blend, params: { out: resolve(outArg), selected: !!flags.selected }, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
 };
 
 // `blender-cli new <name> [--save path.blend]` — scaffold a clean project with camera + light.
-commands.new = async (args) => {
-  const { flags, positional } = fdn.parseArgs(args, ['save', 'blender']);
+commands.new = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['save', 'blender', 'timeout']);
   const name = positional.join(' ') || 'untitled';
   const save = flags.save || join(process.cwd(), `${name.replace(/\s+/g, '_')}.blend`);
   const body = `bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -164,23 +454,34 @@ light.location = (4.0, 1.0, 6.0)
 sc.render.resolution_x = 1920; sc.render.resolution_y = 1080
 result["scaffolded"] = {"scene": sc.name, "camera": cam.name, "light": light.name}`;
   const r = runBlender(body, { save, params: { name }, flags });
-  fdn.out(r); if (!r.ok) process.exit(1);
+  show(r, ctx); if (!r.ok) process.exit(1);
 };
 
+commands.version = (args, ctx) => show({ name: PKG.name, version: PKG.version }, ctx);
+
 commands.help = () => {
-  console.error(`blender-cli — drive Blender headless from your agent (JSON out; -H for table)
+  console.error(`blender-cli ${PKG.version} — drive Blender headless from your agent (JSON out; -H pretty-prints)
 
-Usage: blender-cli <command> [args] [--blender <path>] [--human]
+Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--human]
 
-  doctor                       find Blender, confirm headless bpy works, print version   <-- run this first
+  doctor                       find Blender, verify headless bpy, report version support,
+                               import/export formats, video support, GPU devices   <-- run this first
   new <name> [--save f.blend]  scaffold a clean project (camera + key light + 1080p)
-  exec "<bpy>"  [--blend f] [--save f]   run agent-authored bpy; set result[...] keys -> JSON back
-  run <script.py> [--blend f] [--save f] same, from a .py file
-  scene [--blend f]            dump objects / frame range / materials / keyframe counts as JSON
+  exec "<bpy>"  [--blend f] [--save f] [--check]   run agent-authored bpy; set result[...] keys -> JSON back
+  run <script.py> [--blend f] [--save f] [--check] same, from a .py file
+  scene [--blend f]            dump objects / frame range / engine / materials / keyframes as JSON
+  import <file> [--blend f] [--save f]   pull an asset in: glb gltf obj fbx stl ply usd abc dae
+  export <out.glb> [--blend f] [--selected]  hand the scene on: glb gltf obj fbx stl ply usd
   render [--blend f] --out preview.png [--frame N] [--res 1280x720]
+         [--engine cycles|eevee|workbench] [--device cpu|cuda|optix|metal|hip|oneapi] [--samples N] [--denoise on|off]
+  render --animation --out clip.mp4 [--frames 1..48] [--fps 24] [...]  render the frame range
+         (MP4/MOV/WEBM via Blender's ffmpeg, or a PNG sequence for any other --out)
+  version                      print name + version
 
-Env: BLENDER_BIN overrides the binary path (default /Applications/Blender.app/Contents/MacOS/Blender).
-The agent writes bpy for building/animating; the CLI just runs it deterministically and reports state.`);
+Guardrails: --check compiles agent code + flags risky calls without executing;
+--timeout <sec> kills a hung Blender instead of hanging your agent.
+Env: BLENDER_BIN overrides the binary (auto-detected on macOS / Linux / snap / flatpak / Windows).
+The agent writes bpy for building/animating; the CLI runs it deterministically and reports state.`);
 };
 
 fdn.run({ commands, help: commands.help }, process.argv.slice(2));
