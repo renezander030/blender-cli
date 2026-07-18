@@ -16,6 +16,12 @@
 npm install -g blender-cli && blender-cli doctor
 ```
 
+## New in v0.2.0
+
+- **Poly Haven asset import**: `import polyhaven:<id>` fetches any of Poly Haven's thousands of free assets and does the right thing per kind: models land as objects (with all texture sidecars), HDRIs become the world environment, textures become a wired Principled BSDF material. Downloads cache in `~/.cache/blender-cli`, so repeat imports cost zero bytes.
+- **Text-to-3D**: `generate "a weathered wooden barrel" --import` submits to Meshy (bring your `MESHY_API_KEY`), polls to completion, downloads the GLB and drops it straight into your scene.
+- **`--safe` mode**: an AST gate for `exec`/`run` that *refuses* agent code touching banned modules (`os`, `subprocess`, `socket`, ...), `eval`/`exec`, write-mode `open()`, or system/filesystem escape attributes, then runs clean code in a namespace containing only `bpy`, `PARAMS` and `result`. `BLENDER_CLI_SAFE=1` makes it the default; `--unsafe` overrides. Best-effort static gate, not a jail; `--check` remains the advisory scanner.
+
 ## New in v0.1.0
 
 - **`import` / `export`**: glTF/GLB, OBJ, FBX, STL, PLY, USD in and out. ML output in, engine-ready asset out.
@@ -79,10 +85,12 @@ One JSON object on stdout per invocation; exit code 1 exactly when `ok` is false
 |---------|--------------|
 | `doctor` | Locate Blender, verify headless `bpy`, report version support, import/export formats, video support, engines, GPU devices. **Run this first.** |
 | `new <name> [--save f.blend]` | Scaffold a clean project (camera + key light + 1080p). |
-| `exec "<bpy>" [--blend f] [--save f] [--check]` | Run agent-authored `bpy`; set keys on `result` and they come back as JSON. `--check` compiles + flags risky calls without executing. |
+| `exec "<bpy>" [--blend f] [--save f] [--check] [--safe]` | Run agent-authored `bpy`; set keys on `result` and they come back as JSON. `--check` compiles + flags risky calls without executing; `--safe` refuses code that trips the AST gate. |
 | `run <script.py> [--blend f] [--save f] [--check]` | Same, from a `.py` file. |
 | `scene [--blend f]` | Dump objects, frame range, engine, resolution, materials and keyframe counts as JSON. |
-| `import <file> [--blend f] [--save f]` | Pull an asset in: `glb gltf obj fbx stl ply usd usda usdc usdz abc dae`. Reports what arrived (objects, types, vert count). |
+| `import <file> [--blend f] [--save f]` | Pull an asset in: `glb gltf obj fbx stl ply usd usda usdc usdz abc dae`; a local `.hdr`/`.exr` becomes the world environment. Reports what arrived (objects, types, vert count). |
+| `import polyhaven:<id> [--type hdri\|texture\|model] [--res 1k\|2k\|4k]` | Fetch + import a [Poly Haven](https://polyhaven.com) asset: model → objects, HDRI → world environment, texture → wired PBR material. Cached in `~/.cache/blender-cli`. |
+| `generate "<prompt>" [--out f.glb] [--import] [--wait sec]` | Text-to-3D via [Meshy](https://www.meshy.ai) (`MESHY_API_KEY` required): submit, poll, download the GLB, optionally chain into the scene. |
 | `export <out> [--blend f] [--selected]` | Hand the scene on: `glb gltf obj fbx stl ply usd`. Format from the extension. |
 | `render [--blend f] --out p.png [--frame N] [--res WxH] [--engine E] [--device D] [--samples N] [--denoise on\|off]` | Single-frame preview with a verifiable result: engine, resolution, samples, duration, bytes. |
 | `render --animation --out clip.mp4 [--frames 1..48] [--fps 24] [...]` | Render the frame range: MP4/MOV/WEBM via Blender's ffmpeg, or a PNG sequence for any other `--out`. |

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0 (2026-07-18)
+
+Ports the remaining unique features from the experimental TypeScript branch into the canonical zero-dependency implementation, with the known gaps in that branch fixed. The TS branch is archived as tag `archive/ts-rewrite`.
+
+### Added
+
+- `import polyhaven:<id> [--type hdri|texture|model] [--res 1k|2k|4k]`: fetch and import Poly Haven assets. Models import with all glTF texture sidecars, HDRIs become the world environment (Background + Environment Texture nodes), textures become a Principled BSDF material with Base Color/Roughness/Metallic/Normal/Alpha wired and correct color spaces. Downloads cache in `~/.cache/blender-cli/polyhaven` and are skipped on size match (the TS branch re-downloaded every time).
+- `generate "<prompt>" [--out f.glb] [--import] [--wait sec] [--backend meshy]`: text-to-3D via the Meshy API (`MESHY_API_KEY` from the environment or the CLI-local `.env`, which the TS branch ignored). Submits a preview task, polls every 5 s until `--wait` (default 300 s), downloads the GLB, and with `--import` chains straight into the scene. `MESHY_API_BASE` can point at a mock for testing.
+- `exec`/`run` `--safe`: an in-Blender AST gate that refuses agent code containing banned imports (`os`, `subprocess`, `socket`, `shutil`, `sys`, `ctypes`, `urllib`, `http`), `eval`/`exec`/`__import__`, write-mode `open()` (including pathlib's positional `Path.open("w")`, which slipped through the TS gate), `getattr` escapes, and system/filesystem escape attributes. Violations come back structured in `result.violations`. Clean code runs in a namespace containing only `bpy`, `PARAMS`, `result` (the TS gate executed in the wrapper's globals, where the banned `os`/`sys` modules were already imported). `BLENDER_CLI_SAFE=1` makes safe mode the default; `--unsafe` overrides.
+- Failed runs now include any partial `result` the agent set before the exception.
+
+### Not ported (deliberately)
+
+- The TS branch's `add`/`keyframe` verbs: they duplicate what `exec` does and cut against the core architecture decision that the agent writes the bpy.
+- The TS branch's `verify` scene lint: its bounding-box overlap check fires on any object resting on another (touching counts as overlap), which makes it noisy on normal scenes. Recorded as an opportunity-graph candidate to redesign properly.
+
 ## 0.1.0 (2026-07-18)
 
 The release that takes blender-cli from a headless executor to a full agent pipeline: assets in, animation out, renders you can verify, and guardrails around agent-authored code. Every item was mined from recurring, cited pain in the agent-Blender ecosystem and verified end-to-end against Blender 4.3.

@@ -6,9 +6,9 @@
 
 import * as fdn from './foundation.js';
 import { spawnSync } from 'node:child_process';
-import { writeFileSync, existsSync, readFileSync, mkdtempSync, readdirSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync, mkdtempSync, readdirSync, mkdirSync, statSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname, basename, sep } from 'node:path';
 
 const DIR = fdn.dirOf(import.meta.url);
 const env = fdn.loadEnv(`${DIR}/.env`);
@@ -107,7 +107,9 @@ try:
         result.setdefault("saved", PARAMS["__save__"])
     _finish({"ok": True, "result": result, "ms": int((time.time() - _t0) * 1000)})
 except Exception as e:
-    _finish({"ok": False, "error": str(e), "trace": traceback.format_exc()})
+    _p = {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+    if result: _p["result"] = result
+    _finish(_p)
     sys.exit(1)
 `;
   writeFileSync(script, wrapper);
@@ -127,6 +129,190 @@ except Exception as e:
   if (!m) return { ok: false, error: 'no result from Blender (script may have crashed before emit)', exit: r.status, stderr_tail: (r.stderr || '').slice(-800), stdout_tail: out.slice(-800), bin };
   try { return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')); } catch (e) { return { ok: false, error: 'bad JSON from Blender', raw: m[1].slice(0, 800) }; }
 }
+
+// --- Asset backends: Poly Haven download + Meshy text-to-3D (Node >=18 fetch) --
+// Downloads land in ~/.cache/blender-cli/ and are skipped when the file already
+// exists with the expected size, so repeat imports cost zero bytes.
+async function downloadTo(url, dest, expectedSize = null, { force = false } = {}) {
+  if (!force && existsSync(dest) && (expectedSize == null || statSync(dest).size === expectedSize)) return { cached: true };
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download failed (${r.status}): ${url}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, buf);
+  return { cached: false, bytes: buf.length };
+}
+
+async function fetchJson(url, headers = {}) {
+  const r = await fetch(url, { headers });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+const PH_TYPE_NAMES = { 0: 'hdri', 1: 'texture', 2: 'model' };
+const PH_NON_MAP_KEYS = new Set(['blend', 'gltf', 'usd', 'fbx', 'mtlx']);
+
+async function polyhavenDownload(assetId, { type, res }) {
+  if (type && !['hdri', 'texture', 'model'].includes(type)) throw new Error(`invalid --type: ${type} (use hdri|texture|model)`);
+  let info;
+  try { info = await fetchJson(`https://api.polyhaven.com/info/${assetId}`); }
+  catch (e) { throw new Error(`polyhaven info ${assetId}: ${e.message} (unknown asset id?)`); }
+  let files;
+  try { files = await fetchJson(`https://api.polyhaven.com/files/${assetId}`); }
+  catch (e) { throw new Error(`polyhaven files ${assetId}: ${e.message}`); }
+  const kind = type || PH_TYPE_NAMES[info.type] || 'texture';
+  const outDir = join(homedir(), '.cache', 'blender-cli', 'polyhaven', assetId, res);
+  const dl = { kind, files: [], cached: 0 };
+  const grab = async (url, dest, size) => {
+    const d = await downloadTo(url, dest, size ?? null);
+    if (d.cached) dl.cached++;
+    dl.files.push(dest);
+    return dest;
+  };
+  if (kind === 'hdri') {
+    const atRes = files.hdri?.[res];
+    if (!atRes) throw new Error(`no hdri at resolution ${res} for ${assetId} (available: ${Object.keys(files.hdri || {}).join(', ') || 'none'})`);
+    const fmt = atRes.hdr || atRes.exr;
+    if (!fmt) throw new Error(`no hdr/exr file for ${assetId}@${res}`);
+    dl.main = await grab(fmt.url, join(outDir, basename(new URL(fmt.url).pathname)), fmt.size);
+  } else if (kind === 'model') {
+    const main = files.gltf?.[res]?.gltf;
+    if (!main) throw new Error(`no gltf package at resolution ${res} for ${assetId} (available: ${Object.keys(files.gltf || {}).join(', ') || 'none'})`);
+    dl.main = await grab(main.url, join(outDir, basename(new URL(main.url).pathname)), main.size);
+    const root = resolve(outDir);
+    for (const [rel, f] of Object.entries(main.include || {})) {
+      const dest = resolve(join(outDir, rel));
+      if (dest !== root && !dest.startsWith(root + sep)) throw new Error(`refusing include path outside cache dir: ${rel}`);
+      await grab(f.url, dest, f.size);
+    }
+  } else {
+    const maps = {};
+    for (const [mapName, byRes] of Object.entries(files)) {
+      if (PH_NON_MAP_KEYS.has(mapName)) continue;
+      const fmt = byRes?.[res] && (byRes[res].jpg || byRes[res].png || byRes[res].exr);
+      if (!fmt) continue;
+      maps[mapName] = await grab(fmt.url, join(outDir, basename(new URL(fmt.url).pathname)), fmt.size);
+    }
+    if (!Object.keys(maps).length) throw new Error(`no texture maps at resolution ${res} for ${assetId}`);
+    dl.maps = maps;
+  }
+  return dl;
+}
+
+// Import-by-extension body shared by `import`, `import polyhaven:<model>`, and
+// `generate --import`. Reads PARAMS["file"].
+const IMPORT_BODY = `p = PARAMS["file"]; ext = p.lower().rsplit(".", 1)[-1]
+before = set(o.name for o in bpy.data.objects)
+wm = dir(bpy.ops.wm)
+if ext in ("glb", "gltf"): bpy.ops.import_scene.gltf(filepath=p)
+elif ext == "obj": (bpy.ops.wm.obj_import(filepath=p) if "obj_import" in wm else bpy.ops.import_scene.obj(filepath=p))
+elif ext == "fbx": bpy.ops.import_scene.fbx(filepath=p)
+elif ext == "stl": (bpy.ops.wm.stl_import(filepath=p) if "stl_import" in wm else bpy.ops.import_mesh.stl(filepath=p))
+elif ext == "ply": (bpy.ops.wm.ply_import(filepath=p) if "ply_import" in wm else bpy.ops.import_mesh.ply(filepath=p))
+elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_import(filepath=p)
+elif ext == "abc": bpy.ops.wm.alembic_import(filepath=p)
+elif ext == "dae": bpy.ops.wm.collada_import(filepath=p)
+else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz abc dae)")
+added = [o for o in bpy.data.objects if o.name not in before]
+result["imported"] = {"file": p, "format": ext, "objects": [{"name": o.name, "type": o.type} for o in added],
+    "count": len(added), "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH")}`;
+
+// HDRI → world environment; texture maps → a wired Principled BSDF material.
+const HDRI_IMPORT_BODY = `w = bpy.data.worlds.get("World") or bpy.data.worlds.new("World")
+bpy.context.scene.world = w
+w.use_nodes = True
+nt = w.node_tree
+nt.nodes.clear()
+bg = nt.nodes.new("ShaderNodeBackground")
+env_node = nt.nodes.new("ShaderNodeTexEnvironment")
+env_node.image = bpy.data.images.load(PARAMS["path"])
+out_node = nt.nodes.new("ShaderNodeOutputWorld")
+nt.links.new(env_node.outputs["Color"], bg.inputs["Color"])
+nt.links.new(bg.outputs["Background"], out_node.inputs["Surface"])
+result["world"] = w.name
+result["hdri_image"] = PARAMS["path"]`;
+
+const TEXTURE_IMPORT_BODY = `mat = bpy.data.materials.new(PARAMS["material_name"])
+mat.use_nodes = True
+nt = mat.node_tree
+bsdf = nt.nodes.get("Principled BSDF")
+ROUTE = {"Diffuse": ("Base Color", "sRGB"), "diff": ("Base Color", "sRGB"), "diffuse": ("Base Color", "sRGB"),
+    "Rough": ("Roughness", "Non-Color"), "rough": ("Roughness", "Non-Color"),
+    "Metal": ("Metallic", "Non-Color"), "metal": ("Metallic", "Non-Color"),
+    "nor_gl": ("Normal", "Non-Color"), "normal": ("Normal", "Non-Color"),
+    "Opacity": ("Alpha", "Non-Color")}
+added = []
+for map_name, path in PARAMS["maps"].items():
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.image = bpy.data.images.load(path)
+    target, cs = ROUTE.get(map_name, (None, "Non-Color"))
+    try: tex.image.colorspace_settings.name = cs
+    except Exception: pass
+    if target and bsdf:
+        if target == "Normal":
+            nm = nt.nodes.new("ShaderNodeNormalMap")
+            nt.links.new(tex.outputs["Color"], nm.inputs["Color"])
+            nt.links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
+        else:
+            nt.links.new(tex.outputs["Color"], bsdf.inputs[target])
+    added.append(map_name)
+result["material"] = mat.name
+result["maps_added"] = added`;
+
+// --safe gate: AST-validate agent code inside Blender, refuse on violations,
+// then exec in a CLEAN namespace (bpy/PARAMS/result only) so wrapper imports
+// like os/sys never leak in. Best-effort static gate, not a jail.
+const SAFE_EXEC_BODY = `import ast
+with open(PARAMS["__user__"], encoding="utf-8") as _f:
+    _src = _f.read()
+violations = []
+tree = None
+try:
+    tree = ast.parse(_src)
+except SyntaxError as e:
+    violations.append("syntax error: %s" % e)
+BANNED_IMPORTS = {"os", "subprocess", "socket", "shutil", "sys", "ctypes", "urllib", "http"}
+BANNED_CALLS = {"eval", "exec", "__import__"}
+BANNED_ATTRS = {"system", "popen", "spawnl", "spawnv", "spawnve", "fork", "execl", "execv", "execve", "execvp",
+    "startfile", "rmtree", "write_text", "write_bytes", "chmod", "symlink_to", "hardlink_to", "removedirs"}
+def _mode_is_write(call, mode_idx):
+    for kw in call.keywords:
+        if kw.arg == "mode" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+            return any(c in kw.value.value for c in "wax+")
+    if len(call.args) > mode_idx:
+        a = call.args[mode_idx]
+        if isinstance(a, ast.Constant) and isinstance(a.value, str):
+            return any(c in a.value for c in "wax+")
+    return False
+if tree is not None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for n in node.names:
+                if n.name.split(".")[0] in BANNED_IMPORTS: violations.append("import of banned module: " + n.name)
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in BANNED_IMPORTS: violations.append("import-from banned module: " + str(node.module))
+        elif isinstance(node, ast.Call):
+            f = node.func
+            fname = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+            if fname in BANNED_CALLS: violations.append("call to banned builtin: " + fname)
+            if fname == "open" and _mode_is_write(node, 1 if isinstance(f, ast.Name) else 0):
+                violations.append("open()/.open() call in write/append mode")
+            if fname == "getattr" and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in BANNED_IMPORTS:
+                violations.append("getattr() escape via banned module: " + node.args[0].id)
+            if fname in BANNED_ATTRS and isinstance(f, ast.Attribute):
+                violations.append("attribute access looks like a system/filesystem escape: ." + fname)
+if violations:
+    result["violations"] = sorted(set(violations))
+    raise RuntimeError("sandbox: rejected %d violation(s)" % len(set(violations)))
+if PARAMS.get("__validate_only__"):
+    result["safe_gate"] = "pass"
+else:
+    _ns = {"bpy": bpy, "PARAMS": PARAMS, "result": result, "math": math, "json": json, "time": time, "__builtins__": __builtins__}
+    exec(compile(tree, "<agent-bpy>", "exec"), _ns)
+    _r = _ns.get("result")
+    if _r is not result:
+        if isinstance(_r, dict): result.update(_r)
+        else: result["value"] = _r`;
 
 const commands = {};
 
@@ -183,11 +369,20 @@ result["gpu_devices"] = devs`, { flags });
 // The agent writes bpy; set keys on `result` and they come back as JSON.
 // --check compiles the code and flags risky calls WITHOUT executing anything
 // (ok:false + exit 1 when the code does not compile — same contract as everywhere).
-// --timeout <sec> kills a hung Blender instead of hanging the agent.
+// --safe refuses to run code that trips the AST gate (BLENDER_CLI_SAFE=1 makes
+// it the default; --unsafe overrides). --timeout <sec> kills a hung Blender.
 const EXEC_FLAGS = ['blend', 'save', 'blender', 'timeout'];
-const EXEC_USAGE = 'blender-cli exec "<bpy code>" [--blend f.blend] [--save out.blend] [--check] [--timeout sec]';
+const EXEC_USAGE = 'blender-cli exec "<bpy code>" [--blend f.blend] [--save out.blend] [--check] [--safe] [--timeout sec]';
 async function execBody(body, args, ctx) {
   const { flags } = fdn.parseArgs(args, EXEC_FLAGS);
+  const safeMode = flags.unsafe ? false
+    : flags.safe ? true
+    : (env.BLENDER_CLI_SAFE ?? process.env.BLENDER_CLI_SAFE) === '1';
+  const writeUserFile = () => {
+    const f = join(mkdtempSync(join(tmpdir(), 'blender-cli-')), 'user.py');
+    writeFileSync(f, body);
+    return f;
+  };
   if (flags.check) {
     const checker = `import re
 code = PARAMS["__code__"]
@@ -215,10 +410,17 @@ result["warnings"] = [{"call": name, "risk": why} for pat, name, why in RISKY if
 result["checked_only"] = True`;
     const r = runBlender(checker, { params: { __code__: body }, flags });
     if (r.ok && r.result && r.result.compiles === false) { r.ok = false; r.error = 'agent code does not compile'; }
+    if (r.ok && safeMode) {
+      const g = runBlender(SAFE_EXEC_BODY, { params: { __user__: writeUserFile(), __validate_only__: true }, flags });
+      if (g.ok) r.result.safe_gate = g.result?.safe_gate || 'pass';
+      else { r.ok = false; r.error = g.error; if (g.result?.violations) r.result.violations = g.result.violations; }
+    }
     show(r, ctx); if (!r.ok) process.exit(1);
     return;
   }
-  const r = runBlender(body, { blend: flags.blend, save: flags.save, flags });
+  const r = safeMode
+    ? runBlender(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __user__: writeUserFile() }, flags })
+    : runBlender(body, { blend: flags.blend, save: flags.save, flags });
   show(r, ctx); if (!r.ok) process.exit(1);
 }
 commands.exec = async (args, ctx) => {
@@ -380,33 +582,99 @@ _meta(result, sc)`;
   show(r, ctx); if (!r.ok) process.exit(1);
 };
 
-// `blender-cli import <file>` — pull an asset into the scene (ML output, scans,
-// downloads): glTF/GLB, OBJ, FBX, STL, PLY, USD, Alembic, Collada. Reports what
-// arrived so the agent can verify. Legacy operators are used below Blender 4.x.
+// `blender-cli import <file | polyhaven:id>` — pull an asset into the scene:
+// a local file (glTF/GLB, OBJ, FBX, STL, PLY, USD, Alembic, Collada) or a Poly
+// Haven asset by id (model -> imported, hdri -> world environment, texture ->
+// wired PBR material). Reports what arrived so the agent can verify.
 commands.import = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender', 'timeout']);
-  const file = positional[0];
-  if (!file || !existsSync(file)) {
-    show({ ok: false, error: `asset file not found: ${file || '(none given)'}`, usage: 'blender-cli import <asset-file> [--blend f] [--save f]' }, ctx);
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender', 'timeout', 'type', 'res']);
+  const src = positional[0];
+  if (src && src.startsWith('polyhaven:')) {
+    const assetId = src.slice('polyhaven:'.length);
+    const res = flags.res || '1k';
+    let dl;
+    try { dl = await polyhavenDownload(assetId, { type: flags.type, res }); }
+    catch (e) {
+      show({ ok: false, error: e.message, hint: 'check the asset id on https://polyhaven.com, --type hdri|texture|model, --res 1k|2k|4k' }, ctx);
+      process.exit(1);
+    }
+    const r = dl.kind === 'hdri' ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: dl.main }, flags })
+      : dl.kind === 'model' ? runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: dl.main }, flags })
+      : runBlender(TEXTURE_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { maps: dl.maps, material_name: assetId }, flags });
+    if (r.ok) r.result = { ...(r.result || {}), asset_id: assetId, asset_type: dl.kind, resolution: res, files: dl.files.length, cached: dl.cached };
+    show(r, ctx); if (!r.ok) process.exit(1);
+    return;
+  }
+  if (!src || !existsSync(src)) {
+    show({ ok: false, error: `asset file not found: ${src || '(none given)'}`, usage: 'blender-cli import <asset-file | polyhaven:id> [--blend f] [--save f] [--type hdri|texture|model] [--res 1k|2k|4k]' }, ctx);
     process.exit(1);
   }
-  const body = `p = PARAMS["file"]; ext = p.lower().rsplit(".", 1)[-1]
-before = set(o.name for o in bpy.data.objects)
-wm = dir(bpy.ops.wm)
-if ext in ("glb", "gltf"): bpy.ops.import_scene.gltf(filepath=p)
-elif ext == "obj": (bpy.ops.wm.obj_import(filepath=p) if "obj_import" in wm else bpy.ops.import_scene.obj(filepath=p))
-elif ext == "fbx": bpy.ops.import_scene.fbx(filepath=p)
-elif ext == "stl": (bpy.ops.wm.stl_import(filepath=p) if "stl_import" in wm else bpy.ops.import_mesh.stl(filepath=p))
-elif ext == "ply": (bpy.ops.wm.ply_import(filepath=p) if "ply_import" in wm else bpy.ops.import_mesh.ply(filepath=p))
-elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_import(filepath=p)
-elif ext == "abc": bpy.ops.wm.alembic_import(filepath=p)
-elif ext == "dae": bpy.ops.wm.collada_import(filepath=p)
-else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz abc dae)")
-added = [o for o in bpy.data.objects if o.name not in before]
-result["imported"] = {"file": p, "format": ext, "objects": [{"name": o.name, "type": o.type} for o in added],
-    "count": len(added), "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH")}`;
-  const r = runBlender(body, { blend: flags.blend, save: flags.save, params: { file: resolve(file) }, flags });
+  const localExt = src.toLowerCase().split('.').pop();
+  const r = (flags.type === 'hdri' || ['hdr', 'exr'].includes(localExt))
+    ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: resolve(src) }, flags })
+    : runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: resolve(src) }, flags });
   show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// `blender-cli generate "<prompt>"` — text-to-3D via Meshy (MESHY_API_KEY),
+// download the GLB, optionally chain straight into the scene with --import.
+commands.generate = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['out', 'backend', 'blend', 'save', 'blender', 'timeout', 'wait']);
+  const prompt = positional.join(' ').trim();
+  const usage = 'blender-cli generate "<prompt>" [--out asset.glb] [--import] [--blend f] [--save f] [--wait sec]';
+  if (!prompt) { show({ ok: false, error: 'missing prompt', usage }, ctx); process.exit(1); }
+  const backend = flags.backend || 'meshy';
+  if (backend !== 'meshy') { show({ ok: false, error: `unknown backend: ${backend}`, hint: 'available: meshy' }, ctx); process.exit(1); }
+  const apiKey = env.MESHY_API_KEY || process.env.MESHY_API_KEY;
+  if (!apiKey) { show({ ok: false, error: 'MESHY_API_KEY not set', hint: 'export MESHY_API_KEY=<key from https://www.meshy.ai> and retry' }, ctx); process.exit(1); }
+  const waitSec = flags.wait !== undefined ? Number(flags.wait) : 300;
+  if (!Number.isFinite(waitSec) || waitSec <= 0) { show({ ok: false, error: `invalid --wait: ${flags.wait} (whole seconds)` }, ctx); process.exit(1); }
+  const out = resolve(flags.out || `${prompt.replace(/\W+/g, '_').slice(0, 40) || 'generated'}.glb`);
+  const base = env.MESHY_API_BASE || process.env.MESHY_API_BASE || 'https://api.meshy.ai';
+  const H = { 'Authorization': `Bearer ${apiKey}` };
+  const t0 = Date.now();
+  let taskId = null;
+  try {
+    const sub = await fetch(`${base}/openapi/v2/text-to-3d`, {
+      method: 'POST', headers: { ...H, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'preview', prompt, art_style: 'realistic', should_remesh: true }),
+    });
+    if (!sub.ok) throw new Error(`meshy submit failed: HTTP ${sub.status}: ${(await sub.text()).slice(0, 300)}`);
+    taskId = (await sub.json()).result;
+    const deadline = Date.now() + waitSec * 1000;
+    let task = null, failures = 0;
+    while (true) {
+      try {
+        const p = await fetch(`${base}/openapi/v2/text-to-3d/${taskId}`, { headers: H });
+        if (!p.ok) throw new Error(`HTTP ${p.status}`);
+        task = await p.json(); failures = 0;
+      } catch (e) {
+        failures++;
+        if (failures >= 3) throw new Error(`meshy poll failed 3 times in a row (${e.message}); task ${taskId} may still complete on meshy.ai`);
+      }
+      if (task && ['SUCCEEDED', 'FAILED', 'CANCELED'].includes(task.status)) break;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise(rs => setTimeout(rs, Math.min(5000, remaining)));
+    }
+    if (task?.status !== 'SUCCEEDED') {
+      const extra = task?.task_error?.message ? ` - ${task.task_error.message}` : '';
+      throw new Error(`meshy task did not succeed: ${task?.status ?? 'no response'}${extra}`);
+    }
+    if (!task.model_urls?.glb) throw new Error('meshy task succeeded but no glb url in response');
+    await downloadTo(task.model_urls.glb, out, null, { force: true });
+    const meta = { generated: out, backend, task_id: taskId, status: task.status, bytes: statSync(out).size };
+    if (flags.import) {
+      const r = runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: out }, flags });
+      r.result = { ...(r.result || {}), ...meta };
+      show(r, ctx); if (!r.ok) process.exit(1);
+      return;
+    }
+    show({ ok: true, result: meta, ms: Date.now() - t0 }, ctx);
+  } catch (e) {
+    show({ ok: false, error: e.message, ...(taskId ? { task_id: taskId } : {}) }, ctx);
+    process.exit(1);
+  }
 };
 
 // `blender-cli export <out>` — hand the scene to the next tool in the pipeline:
@@ -467,10 +735,13 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--huma
   doctor                       find Blender, verify headless bpy, report version support,
                                import/export formats, video support, GPU devices   <-- run this first
   new <name> [--save f.blend]  scaffold a clean project (camera + key light + 1080p)
-  exec "<bpy>"  [--blend f] [--save f] [--check]   run agent-authored bpy; set result[...] keys -> JSON back
-  run <script.py> [--blend f] [--save f] [--check] same, from a .py file
+  exec "<bpy>"  [--blend f] [--save f] [--check] [--safe]   run agent-authored bpy; set result[...] keys -> JSON back
+  run <script.py> [--blend f] [--save f] [--check] [--safe] same, from a .py file
   scene [--blend f]            dump objects / frame range / engine / materials / keyframes as JSON
   import <file> [--blend f] [--save f]   pull an asset in: glb gltf obj fbx stl ply usd abc dae
+  import polyhaven:<id> [--type hdri|texture|model] [--res 1k|2k|4k]   fetch + import a Poly Haven asset
+         (model -> objects, hdri -> world environment, texture -> wired PBR material; cached in ~/.cache)
+  generate "<prompt>" [--out f.glb] [--import] [--wait sec]  text-to-3D via Meshy (needs MESHY_API_KEY)
   export <out.glb> [--blend f] [--selected]  hand the scene on: glb gltf obj fbx stl ply usd
   render [--blend f] --out preview.png [--frame N] [--res 1280x720]
          [--engine cycles|eevee|workbench] [--device cpu|cuda|optix|metal|hip|oneapi] [--samples N] [--denoise on|off]
@@ -479,6 +750,8 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--huma
   version                      print name + version
 
 Guardrails: --check compiles agent code + flags risky calls without executing;
+--safe REFUSES code that trips the AST gate (banned imports/calls, write-mode open;
+set BLENDER_CLI_SAFE=1 to make it the default, --unsafe to override);
 --timeout <sec> kills a hung Blender instead of hanging your agent.
 Env: BLENDER_BIN overrides the binary (auto-detected on macOS / Linux / snap / flatpak / Windows).
 The agent writes bpy for building/animating; the CLI runs it deterministically and reports state.`);
