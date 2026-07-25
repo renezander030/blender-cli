@@ -30,12 +30,21 @@ function platformCandidates() {
   ];
   const win = [];
   if (process.platform === 'win32') {
+    // Installer builds: Program Files\Blender Foundation\Blender X.Y\blender.exe (newest first).
     for (const pf of [process.env['ProgramFiles'], process.env['ProgramFiles(x86)']].filter(Boolean)) {
       const base = join(pf, 'Blender Foundation');
       try {
         for (const d of readdirSync(base).sort().reverse()) win.push(join(base, d, 'blender.exe'));
       } catch { /* not installed there */ }
     }
+    // Steam puts Blender under steamapps; the Store build only exposes its
+    // WindowsApps alias; scoop/choco shim into the user profile. All three are
+    // common enough that "not found" on Windows is usually one of them.
+    const pf86 = process.env['ProgramFiles(x86)'];
+    if (pf86) win.push(join(pf86, 'Steam', 'steamapps', 'common', 'Blender', 'blender.exe'));
+    if (process.env['LOCALAPPDATA']) win.push(join(process.env['LOCALAPPDATA'], 'Microsoft', 'WindowsApps', 'blender.exe'));
+    if (process.env['USERPROFILE']) win.push(join(process.env['USERPROFILE'], 'scoop', 'apps', 'blender', 'current', 'blender.exe'));
+    if (process.env['ChocolateyInstall']) win.push(join(process.env['ChocolateyInstall'], 'bin', 'blender.exe'));
     return win;
   }
   return process.platform === 'darwin' ? [...mac, ...linux] : [...linux, ...mac];
@@ -118,8 +127,13 @@ except Exception as e:
   if (blend) { if (!existsSync(blend)) return { ok: false, error: `blend not found: ${blend}` }; args.push(blend); }
   args.push('--python', script, '--python-exit-code', '1');
 
+  // stdin is explicitly closed, never inherited. A Blender that inherits the
+  // agent's stdin can block forever waiting on a pipe nobody writes to (the
+  // classic Windows headless hang) — and --timeout would then be the only thing
+  // ending the call. stdout/stderr stay piped: that's the result channel.
   const r = spawnSync(bin, args, {
     encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'],
     ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, error: `Blender timed out after ${timeoutMs / 1000}s (killed)`, timed_out: true, bin };
@@ -216,6 +230,38 @@ else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl
 added = [o for o in bpy.data.objects if o.name not in before]
 result["imported"] = {"file": p, "format": ext, "objects": [{"name": o.name, "type": o.type} for o in added],
     "count": len(added), "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH")}`;
+
+// Batch import gathers many files into ONE scene, so it has to run inside a
+// single Blender session — separate processes would each start empty and the
+// last one would be all you kept. A file that fails to import is recorded and
+// the rest still land.
+const MULTI_IMPORT_BODY = `wm = dir(bpy.ops.wm)
+def _imp(p):
+    ext = p.lower().rsplit(".", 1)[-1]
+    if ext in ("glb", "gltf"): bpy.ops.import_scene.gltf(filepath=p)
+    elif ext == "obj": (bpy.ops.wm.obj_import(filepath=p) if "obj_import" in wm else bpy.ops.import_scene.obj(filepath=p))
+    elif ext == "fbx": bpy.ops.import_scene.fbx(filepath=p)
+    elif ext == "stl": (bpy.ops.wm.stl_import(filepath=p) if "stl_import" in wm else bpy.ops.import_mesh.stl(filepath=p))
+    elif ext == "ply": (bpy.ops.wm.ply_import(filepath=p) if "ply_import" in wm else bpy.ops.import_mesh.ply(filepath=p))
+    elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_import(filepath=p)
+    elif ext == "abc": bpy.ops.wm.alembic_import(filepath=p)
+    elif ext == "dae": bpy.ops.wm.collada_import(filepath=p)
+    else: raise RuntimeError("unsupported format: ." + ext)
+    return ext
+items = []
+for p in PARAMS["files"]:
+    before = set(o.name for o in bpy.data.objects)
+    try:
+        ext = _imp(p)
+        added = [o for o in bpy.data.objects if o.name not in before]
+        items.append({"file": p, "ok": True, "format": ext, "count": len(added),
+            "objects": [o.name for o in added],
+            "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH" and o.data)})
+    except Exception as e:
+        items.append({"file": p, "ok": False, "error": str(e)})
+_failed = [i for i in items if not i["ok"]]
+result["imported_batch"] = {"total": len(items), "succeeded": len(items) - len(_failed),
+    "failed": len(_failed), "objects": sum(i.get("count", 0) for i in items), "items": items}`;
 
 // HDRI → world environment; texture maps → a wired Principled BSDF material.
 const HDRI_IMPORT_BODY = `w = bpy.data.worlds.get("World") or bpy.data.worlds.new("World")
@@ -314,15 +360,62 @@ else:
         if isinstance(_r, dict): result.update(_r)
         else: result["value"] = _r`;
 
+// --- Batch: one verb over many files ----------------------------------------
+// Deliberately a tiny matcher, not a glob library: `*` and `?` in the LAST path
+// segment only, no `**`. Quote the pattern so it reaches us unexpanded — an
+// unquoted glob is expanded by the shell before the CLI ever sees it.
+function globFiles(pattern) {
+  const abs = resolve(pattern);
+  const dir = dirname(abs);
+  const pat = basename(abs);
+  if (!/[*?]/.test(pat)) return existsSync(abs) ? [abs] : [];
+  const rx = new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+  let entries;
+  try { entries = readdirSync(dir); } catch { return []; }
+  return entries.filter(f => rx.test(f)).sort().map(f => join(dir, f));
+}
+
+// Every item runs; a failure is recorded against its file and the run continues.
+// One unreadable .blend in a folder of forty should cost you that one render,
+// not the batch — so the exit code reports the whole outcome at the end.
+async function batchRun(files, fn) {
+  const items = [];
+  for (const f of files) {
+    let r;
+    try { r = await fn(f); } catch (e) { r = { ok: false, error: e.message }; }
+    items.push({ file: f, ok: r?.ok === true, ...(r?.ok ? { result: r.result } : { error: r?.error || 'unknown failure' }) });
+  }
+  const failed = items.filter(i => !i.ok).length;
+  return { ok: failed === 0, result: { total: items.length, succeeded: items.length - failed, failed, items } };
+}
+
+const stemOf = (f) => basename(f).replace(/\.[^.]+$/, '');
+
 const commands = {};
 
 // `blender-cli doctor` — find Blender, confirm headless bpy works, report
 // version verdict, importers/exporters, video support, and GPU render devices.
-const TESTED_VERSIONS = ['4.3'];
+//
+// TESTED_VERSIONS is the matrix the release was actually run against, not a
+// guess. Anything outside it reports `untested`, never `supported`: claiming
+// support for a major nobody exercised is how a tool tells a user everything is
+// fine right up until an operator it never called moved.
+const TESTED_VERSIONS = ['4.3', '5.2'];
+const MIN_VERSION = [3, 0];
+
+function supportVerdict(v) {
+  if (!v) return null;
+  const mm = `${v[0]}.${v[1]}`;
+  if (TESTED_VERSIONS.includes(mm)) return `tested (${mm})`;
+  if (v[0] < MIN_VERSION[0]) return `unsupported (needs Blender ${MIN_VERSION.join('.')}+)`;
+  const newest = TESTED_VERSIONS[TESTED_VERSIONS.length - 1];
+  const drift = v[0] > Number(newest.split('.')[0]) ? 'newer major than anything in the matrix' : 'not in the tested matrix';
+  return `untested (${drift}; tested on ${TESTED_VERSIONS.join(', ')}) — engines and import/export operators are resolved at runtime, so it may well work; please report breakage at https://github.com/renezander030/blender-cli/issues`;
+}
 commands.doctor = async (args, ctx) => {
   const { flags } = fdn.parseArgs(args, ['blender', 'timeout']);
   const { bin, tried } = blenderBinInfo(flags);
-  const ver = spawnSync(bin, ['--version'], { encoding: 'utf8' });
+  const ver = spawnSync(bin, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   if (ver.error) {
     show({ ok: false, blender_bin: bin, error: `not found/executable: ${ver.error.message}`, searched: tried, hint: 'set BLENDER_BIN or pass --blender <path>' }, ctx);
     process.exit(1);
@@ -340,6 +433,15 @@ result["formats"] = {
     "usd": "usd_import" in imp, "alembic": "alembic_import" in imp, "collada": "collada_import" in imp}
 result["video_ffmpeg"] = "FFMPEG" in [i.identifier for i in bpy.types.ImageFormatSettings.bl_rna.properties["file_format"].enum_items]
 result["engines"] = [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items]
+# Cycles denoises by default; a build without OpenImageDenoise fails the render
+# outright instead of saying so. Worth knowing BEFORE the render, not after.
+try:
+    _prev = bpy.context.scene.render.engine
+    bpy.context.scene.render.engine = "CYCLES"
+    result["cycles_denoiser"] = bpy.context.scene.cycles.denoiser or None
+    bpy.context.scene.render.engine = _prev
+except Exception:
+    result["cycles_denoiser"] = None
 devs = []
 try:
     prefs = bpy.context.preferences.addons["cycles"].preferences
@@ -353,14 +455,12 @@ except Exception:
     pass
 result["gpu_devices"] = devs`, { flags });
   const v = probe.ok ? probe.result.bpy_version : null;
-  const verdict = !v ? null
-    : (v[0] === 4 && v[1] >= 2) || v[0] >= 5 ? `supported (tested on ${TESTED_VERSIONS.join(', ')})`
-    : v[0] >= 3 ? 'expected to work (not in the tested matrix; legacy import/export operators are used automatically where needed)'
-    : 'unsupported (needs Blender 3.0+)';
+  const verdict = supportVerdict(v);
   show({
     ok: probe.ok === true, blender_bin: bin, version: versionLine,
     platform: process.platform, headless_ok: probe.ok === true,
-    support: verdict, ...(probe.result || {}), error: probe.error || undefined,
+    support: verdict, tested_versions: TESTED_VERSIONS,
+    ...(probe.result || {}), error: probe.error || undefined,
   }, ctx);
   if (!probe.ok) process.exit(1);
 };
@@ -461,13 +561,31 @@ result["lights"] = [o.name for o in sc.objects if o.type == "LIGHT"]`;
 
 // Shared render setup: engine / device / samples / resolution as bpy, from PARAMS.
 const RENDER_SETUP = `sc = bpy.context.scene
+# Resolve the engine identifier from Blender's OWN enum rather than hardcoding
+# it: EEVEE shipped as BLENDER_EEVEE (<=4.1), gained BLENDER_EEVEE_NEXT (4.2+),
+# then took the plain name back in 5.x. Asking the build what it has survives
+# that churn; a hardcoded identifier breaks on every rename.
+_ENGINES = [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items]
+_ENGINE_CANDIDATES = {"cycles": ["CYCLES"],
+    "eevee": ["BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"],
+    "workbench": ["BLENDER_WORKBENCH"]}
+def _resolve_engine(name):
+    cands = _ENGINE_CANDIDATES.get(name)
+    if cands is None: raise RuntimeError("unknown engine: " + name + " (use cycles|eevee|workbench)")
+    # Prefer a candidate the build advertises — that is what picks the right
+    # EEVEE across the 4.2/5.0 renames. The enum is NOT an allowlist: in
+    # --background it only carries built-ins, so Cycles (an addon) is missing
+    # from it even though assigning CYCLES works fine. So: enum first, then try.
+    for c in cands:
+        if c in _ENGINES: return c
+    return cands[-1]
 eng = (PARAMS.get("engine") or "").lower()
 if eng:
-    emap = {"cycles": "CYCLES", "eevee": "BLENDER_EEVEE_NEXT", "workbench": "BLENDER_WORKBENCH"}
-    if eng not in emap: raise RuntimeError("unknown engine: " + eng + " (use cycles|eevee|workbench)")
-    target = emap[eng]
-    if target == "BLENDER_EEVEE_NEXT" and bpy.app.version < (4, 2, 0): target = "BLENDER_EEVEE"
-    sc.render.engine = target
+    _target = _resolve_engine(eng)
+    try:
+        sc.render.engine = _target
+    except TypeError:
+        raise RuntimeError("engine " + eng + " (" + _target + ") is not available in this Blender build (advertised: " + ", ".join(_ENGINES) + ")")
 dev = (PARAMS.get("device") or "").upper()
 if dev:
     if sc.render.engine != "CYCLES": raise RuntimeError("--device needs --engine cycles (got " + sc.render.engine + ")")
@@ -481,12 +599,34 @@ if dev:
             raise RuntimeError("no " + dev + " device available (run doctor to list gpu_devices)")
         for d in devs: d.use = True
         sc.cycles.device = "GPU"
+def _eevee_samples_attr(sc):
+    ee = getattr(sc, "eevee", None)
+    if ee is None: return None, None
+    for a in ("taa_render_samples", "samples_render", "render_samples"):
+        if hasattr(ee, a): return ee, a
+    return None, None
 if PARAMS.get("samples") is not None:
     s = int(PARAMS["samples"])
     if sc.render.engine == "CYCLES": sc.cycles.samples = s
-    elif "EEVEE" in sc.render.engine: sc.eevee.taa_render_samples = s
-if PARAMS.get("denoise") is not None and sc.render.engine == "CYCLES":
-    sc.cycles.use_denoising = str(PARAMS["denoise"]).lower() not in ("off", "false", "0", "no")
+    elif "EEVEE" in sc.render.engine:
+        _ee, _a = _eevee_samples_attr(sc)
+        if _ee is None: raise RuntimeError("this Blender's EEVEE exposes no render-sample setting (tried taa_render_samples/samples_render/render_samples)")
+        setattr(_ee, _a, s)
+if sc.render.engine == "CYCLES":
+    _asked = PARAMS.get("denoise")
+    if _asked is not None:
+        sc.cycles.use_denoising = str(_asked).lower() not in ("off", "false", "0", "no")
+    # Cycles turns denoising ON by default, but a build compiled without
+    # OpenImageDenoise leaves the denoiser empty and then fails the whole render
+    # with "Failed to denoise" — never hinting that denoising was optional and
+    # merely a default. Distro packages ship exactly like this, so a plain
+    # "render --engine cycles" on a server is dead on arrival. Honour an
+    # explicit request with a real error; quietly stand down from the default.
+    if sc.cycles.use_denoising and not sc.cycles.denoiser:
+        if _asked is not None and sc.cycles.use_denoising:
+            raise RuntimeError("--denoise on was requested but this Blender build has no denoiser (no OpenImageDenoise support); re-run with --denoise off")
+        sc.cycles.use_denoising = False
+        result["denoise"] = "off (auto: this Blender build has no OpenImageDenoise support)"
 if PARAMS.get("res"):
     w, h = [int(x) for x in str(PARAMS["res"]).lower().split("x")]
     sc.render.resolution_x, sc.render.resolution_y = w, h
@@ -499,14 +639,16 @@ def _meta(result, sc):
     result["engine"] = sc.render.engine
     result["resolution"] = [sc.render.resolution_x, sc.render.resolution_y]
     if sc.render.engine == "CYCLES": result["samples"] = sc.cycles.samples
-    elif "EEVEE" in sc.render.engine: result["samples"] = sc.eevee.taa_render_samples`;
+    elif "EEVEE" in sc.render.engine:
+        _ee, _a = _eevee_samples_attr(sc)
+        if _ee is not None: result["samples"] = getattr(_ee, _a)`;
 
 // `blender-cli render [--blend f] --out preview.png` — single-frame preview,
 // or `--animation` for the whole frame range as MP4 (via Blender's ffmpeg) or a
 // PNG sequence. Result JSON carries engine/resolution/samples/duration/bytes so
 // the agent can verify the render without a second round-trip.
 commands.render = async (args, ctx) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'frames', 'fps', 'samples', 'res', 'engine', 'device', 'denoise', 'blender', 'timeout']);
+  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'frames', 'fps', 'samples', 'res', 'engine', 'device', 'denoise', 'blender', 'timeout', 'batch', 'ext']);
   const animation = !!flags.animation;
   const out = resolve(flags.out || join(process.cwd(), animation ? 'preview.mp4' : 'preview.png'));
   const params = {
@@ -578,7 +720,22 @@ result["frame_count"] = sc.frame_end - sc.frame_start + 1
 result["fps"] = sc.render.fps
 result["duration_ms"] = int((time.time() - _t) * 1000)
 _meta(result, sc)`;
-  const r = runBlender(animation ? anim : still, { blend: flags.blend, params, flags });
+  const body = animation ? anim : still;
+  if (flags.batch) {
+    const files = globFiles(String(flags.batch));
+    if (!files.length) {
+      show({ ok: false, error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
+      process.exit(1);
+    }
+    // In batch mode --out names a DIRECTORY; each .blend renders to <stem>.<ext>.
+    const outDir = resolve(flags.out || process.cwd());
+    const ext = String(flags.ext || (animation ? 'mp4' : 'png')).replace(/^\./, '');
+    const agg = await batchRun(files, (f) =>
+      runBlender(body, { blend: f, params: { ...params, out: join(outDir, `${stemOf(f)}.${ext}`) }, flags }));
+    show(agg, ctx); if (!agg.ok) process.exit(1);
+    return;
+  }
+  const r = runBlender(body, { blend: flags.blend, params, flags });
   show(r, ctx); if (!r.ok) process.exit(1);
 };
 
@@ -587,8 +744,22 @@ _meta(result, sc)`;
 // Haven asset by id (model -> imported, hdri -> world environment, texture ->
 // wired PBR material). Reports what arrived so the agent can verify.
 commands.import = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender', 'timeout', 'type', 'res']);
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender', 'timeout', 'type', 'res', 'batch']);
   const src = positional[0];
+  if (flags.batch) {
+    const files = globFiles(String(flags.batch));
+    if (!files.length) {
+      show({ ok: false, error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
+      process.exit(1);
+    }
+    const r = runBlender(MULTI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { files }, flags });
+    if (r.ok && r.result?.imported_batch?.failed > 0) {
+      r.ok = false;
+      r.error = `${r.result.imported_batch.failed} of ${r.result.imported_batch.total} file(s) failed to import`;
+    }
+    show(r, ctx); if (!r.ok) process.exit(1);
+    return;
+  }
   if (src && src.startsWith('polyhaven:')) {
     const assetId = src.slice('polyhaven:'.length);
     const res = flags.res || '1k';
@@ -617,27 +788,46 @@ commands.import = async (args, ctx) => {
 };
 
 // `blender-cli generate "<prompt>"` — text-to-3D via Meshy (MESHY_API_KEY),
-// download the GLB, optionally chain straight into the scene with --import.
+// or `--image <file>` for image-to-3D off a reference photo. Downloads the GLB
+// and optionally chains straight into the scene with --import. Both modes share
+// one polling/download/import path; only the endpoint and payload differ.
+const IMAGE_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
 commands.generate = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['out', 'backend', 'blend', 'save', 'blender', 'timeout', 'wait']);
+  const { flags, positional } = fdn.parseArgs(args, ['out', 'backend', 'blend', 'save', 'blender', 'timeout', 'wait', 'image']);
   const prompt = positional.join(' ').trim();
-  const usage = 'blender-cli generate "<prompt>" [--out asset.glb] [--import] [--blend f] [--save f] [--wait sec]';
-  if (!prompt) { show({ ok: false, error: 'missing prompt', usage }, ctx); process.exit(1); }
+  const usage = 'blender-cli generate "<prompt>" | generate --image ref.png [--out asset.glb] [--import] [--blend f] [--save f] [--wait sec]';
+  const imageArg = typeof flags.image === 'string' ? flags.image : null;
+  if (flags.image === true) { show({ ok: false, error: 'missing value for --image', usage }, ctx); process.exit(1); }
+  if (!prompt && !imageArg) { show({ ok: false, error: 'missing prompt (or --image <file>)', usage }, ctx); process.exit(1); }
   const backend = flags.backend || 'meshy';
   if (backend !== 'meshy') { show({ ok: false, error: `unknown backend: ${backend}`, hint: 'available: meshy' }, ctx); process.exit(1); }
+  let imagePath = null, imageMime = null;
+  if (imageArg) {
+    imagePath = resolve(imageArg);
+    if (!existsSync(imagePath)) { show({ ok: false, error: `image not found: ${imageArg}` }, ctx); process.exit(1); }
+    imageMime = IMAGE_MIME[imagePath.toLowerCase().split('.').pop()];
+    if (!imageMime) { show({ ok: false, error: `unsupported image format: ${imagePath.split('.').pop()}`, hint: `use one of: ${Object.keys(IMAGE_MIME).join(', ')}` }, ctx); process.exit(1); }
+  }
   const apiKey = env.MESHY_API_KEY || process.env.MESHY_API_KEY;
   if (!apiKey) { show({ ok: false, error: 'MESHY_API_KEY not set', hint: 'export MESHY_API_KEY=<key from https://www.meshy.ai> and retry' }, ctx); process.exit(1); }
   const waitSec = flags.wait !== undefined ? Number(flags.wait) : 300;
   if (!Number.isFinite(waitSec) || waitSec <= 0) { show({ ok: false, error: `invalid --wait: ${flags.wait} (whole seconds)` }, ctx); process.exit(1); }
-  const out = resolve(flags.out || `${prompt.replace(/\W+/g, '_').slice(0, 40) || 'generated'}.glb`);
+  const stem = imagePath ? basename(imagePath).replace(/\.[^.]+$/, '') : prompt.replace(/\W+/g, '_').slice(0, 40);
+  const out = resolve(flags.out || `${stem || 'generated'}.glb`);
   const base = env.MESHY_API_BASE || process.env.MESHY_API_BASE || 'https://api.meshy.ai';
   const H = { 'Authorization': `Bearer ${apiKey}` };
   const t0 = Date.now();
   let taskId = null;
+  // Meshy keeps image-to-3d on v1 and text-to-3d on v2; the task shape that
+  // comes back (status + model_urls) is the same, so only submission differs.
+  const endpoint = imagePath ? `${base}/openapi/v1/image-to-3d` : `${base}/openapi/v2/text-to-3d`;
+  const payload = imagePath
+    ? { image_url: `data:${imageMime};base64,${readFileSync(imagePath).toString('base64')}`, enable_pbr: true, should_remesh: true, ...(prompt ? { texture_prompt: prompt } : {}) }
+    : { mode: 'preview', prompt, art_style: 'realistic', should_remesh: true };
   try {
-    const sub = await fetch(`${base}/openapi/v2/text-to-3d`, {
+    const sub = await fetch(endpoint, {
       method: 'POST', headers: { ...H, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'preview', prompt, art_style: 'realistic', should_remesh: true }),
+      body: JSON.stringify(payload),
     });
     if (!sub.ok) throw new Error(`meshy submit failed: HTTP ${sub.status}: ${(await sub.text()).slice(0, 300)}`);
     taskId = (await sub.json()).result;
@@ -645,7 +835,7 @@ commands.generate = async (args, ctx) => {
     let task = null, failures = 0;
     while (true) {
       try {
-        const p = await fetch(`${base}/openapi/v2/text-to-3d/${taskId}`, { headers: H });
+        const p = await fetch(`${endpoint}/${taskId}`, { headers: H });
         if (!p.ok) throw new Error(`HTTP ${p.status}`);
         task = await p.json(); failures = 0;
       } catch (e) {
@@ -663,7 +853,7 @@ commands.generate = async (args, ctx) => {
     }
     if (!task.model_urls?.glb) throw new Error('meshy task succeeded but no glb url in response');
     await downloadTo(task.model_urls.glb, out, null, { force: true });
-    const meta = { generated: out, backend, task_id: taskId, status: task.status, bytes: statSync(out).size };
+    const meta = { generated: out, backend, mode: imagePath ? 'image-to-3d' : 'text-to-3d', task_id: taskId, status: task.status, bytes: statSync(out).size, ...(imagePath ? { source_image: imagePath } : {}) };
     if (flags.import) {
       const r = runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: out }, flags });
       r.result = { ...(r.result || {}), ...meta };
@@ -679,17 +869,59 @@ commands.generate = async (args, ctx) => {
 
 // `blender-cli export <out>` — hand the scene to the next tool in the pipeline:
 // glTF/GLB, OBJ, FBX, STL, PLY, USD. Format from the extension.
-commands.export = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'blender', 'timeout']);
-  const outArg = positional[0];
-  if (!outArg) {
-    show({ ok: false, error: 'missing output path', usage: 'blender-cli export <out.glb|obj|fbx|stl|ply|usd> [--blend f] [--selected]' }, ctx);
-    process.exit(1);
-  }
-  const body = `p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
+//
+// Bytes-on-disk is not fidelity. Exporters drop vertex-colour layers, shape-key
+// ranges and whole object types silently, and a corrupt asset then travels down
+// the pipeline looking like a success. So after writing, the file is read BACK
+// into an empty scene and censused against what went in — compared only on the
+// dimensions the target format actually carries, so STL is never accused of
+// losing materials it was never able to hold. --no-verify skips the readback,
+// --strict turns a degraded result into a non-zero exit.
+const EXPORT_BODY = `p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
 sel = bool(PARAMS.get("selected"))
 os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
 wm = dir(bpy.ops.wm)
+
+def _census(objs):
+    meshes = [o for o in objs if o.type == "MESH" and o.data]
+    mats = set()
+    for o in meshes:
+        for m in o.data.materials:
+            if m: mats.add(m.name)
+    def _nsk(o):
+        sk = getattr(o.data, "shape_keys", None)
+        return max(0, len(sk.key_blocks) - 1) if sk else 0
+    return {"objects": len(objs), "meshes": len(meshes),
+        "verts": sum(len(o.data.vertices) for o in meshes),
+        "materials": len(mats),
+        "uv_layers": sum(len(o.data.uv_layers) for o in meshes),
+        "color_attrs": sum(len(getattr(o.data, "color_attributes", []) or []) for o in meshes),
+        "shape_keys": sum(_nsk(o) for o in meshes)}
+
+# What each container can actually represent. Comparing outside this set would
+# manufacture "losses" the format was never capable of carrying.
+#
+# Note the absence of a raw object count: exporters legitimately drop scene
+# furniture (glTF omits cameras and lights unless you ask for them), so counting
+# objects flags a "loss" on nearly every healthy export. "meshes" is the count
+# that speaks to asset payload, and a mesh that actually vanished still shows up
+# there. A check that cries wolf on every run is a check people learn to ignore.
+# STL and PLY are single triangle-soup containers: they collapse every object
+# into one mesh by definition, so comparing mesh COUNT there would report a loss
+# on every multi-object export forever. Their vertex total still tells the truth.
+# (Each row below was measured against real round-trips, not assumed.)
+_ALL = ["meshes", "verts", "materials", "uv_layers", "color_attrs", "shape_keys"]
+_GEO_MAT = ["meshes", "verts", "materials", "uv_layers"]
+CARRIES = {"glb": _ALL, "gltf": _ALL,
+    "obj": _GEO_MAT,
+    "fbx": ["meshes", "verts", "materials", "uv_layers", "shape_keys"],
+    "stl": ["verts"],
+    "ply": ["verts", "color_attrs"],
+    "usd": _GEO_MAT, "usda": _GEO_MAT, "usdc": _GEO_MAT, "usdz": _GEO_MAT}
+
+_scene_objs = [o for o in bpy.context.scene.objects if not sel or o.select_get()]
+before = _census(_scene_objs)
+
 if ext in ("glb", "gltf"): bpy.ops.export_scene.gltf(filepath=p, export_format=("GLB" if ext == "glb" else "GLTF_SEPARATE"), use_selection=sel)
 elif ext == "obj": (bpy.ops.wm.obj_export(filepath=p, export_selected_objects=sel) if "obj_export" in wm else bpy.ops.export_scene.obj(filepath=p, use_selection=sel))
 elif ext == "fbx": bpy.ops.export_scene.fbx(filepath=p, use_selection=sel)
@@ -697,9 +929,170 @@ elif ext == "stl": (bpy.ops.wm.stl_export(filepath=p, export_selected_objects=se
 elif ext == "ply": (bpy.ops.wm.ply_export(filepath=p, export_selected_objects=sel) if "ply_export" in wm else bpy.ops.export_mesh.ply(filepath=p, use_selection=sel))
 elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_export(filepath=p, selected_objects_only=sel)
 else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz)")
-result["exported"] = {"file": p, "format": ext, "bytes": os.path.getsize(p),
-    "objects": len([o for o in bpy.context.scene.objects if not sel or o.select_get()])}`;
-  const r = runBlender(body, { blend: flags.blend, params: { out: resolve(outArg), selected: !!flags.selected }, flags });
+
+result["exported"] = {"file": p, "format": ext, "bytes": os.path.getsize(p), "objects": len(_scene_objs)}
+
+if PARAMS.get("verify"):
+    fid = {"checked": False}
+    try:
+        # Safe to wipe: nothing is saved after an export, so the loaded scene is
+        # scratch from here on. Read the file back the way a consumer would.
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        if ext in ("glb", "gltf"): bpy.ops.import_scene.gltf(filepath=p)
+        elif ext == "obj": (bpy.ops.wm.obj_import(filepath=p) if "obj_import" in wm else bpy.ops.import_scene.obj(filepath=p))
+        elif ext == "fbx": bpy.ops.import_scene.fbx(filepath=p)
+        elif ext == "stl": (bpy.ops.wm.stl_import(filepath=p) if "stl_import" in wm else bpy.ops.import_mesh.stl(filepath=p))
+        elif ext == "ply": (bpy.ops.wm.ply_import(filepath=p) if "ply_import" in wm else bpy.ops.import_mesh.ply(filepath=p))
+        elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_import(filepath=p)
+        else: raise RuntimeError("no importer for ." + ext)
+        after = _census(list(bpy.context.scene.objects))
+        fields = CARRIES.get(ext, ["meshes", "verts"])
+        # More is fine (glTF splits verts at UV/normal seams); less is a loss.
+        lost = [{"field": k, "scene": before[k], "file": after[k]} for k in fields if after[k] < before[k]]
+        fid = {"checked": True, "ok": not lost, "compared": fields,
+            "scene": {k: before[k] for k in fields}, "file": {k: after[k] for k in fields}, "lost": lost}
+    except Exception as e:
+        fid = {"checked": False, "reason": "readback failed: %s" % e}
+    result["exported"]["fidelity"] = fid`;
+
+commands.export = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'blender', 'timeout', 'batch', 'format']);
+  const outArg = positional[0];
+  const verify = !flags['no-verify'];
+  if (flags.batch) {
+    const files = globFiles(String(flags.batch));
+    if (!files.length) {
+      show({ ok: false, error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
+      process.exit(1);
+    }
+    // In batch mode the positional is the output DIRECTORY and --format the extension.
+    const fmt = String(flags.format || '').replace(/^\./, '');
+    if (!fmt) {
+      show({ ok: false, error: 'missing --format in batch mode', usage: 'blender-cli export <out-dir> --batch "blends/*.blend" --format glb' }, ctx);
+      process.exit(1);
+    }
+    const outDir = resolve(outArg || process.cwd());
+    const agg = await batchRun(files, (f) =>
+      runBlender(EXPORT_BODY, { blend: f, params: { out: join(outDir, `${stemOf(f)}.${fmt}`), selected: !!flags.selected, verify }, flags }));
+    if (agg.ok && flags.strict) {
+      const bad = agg.result.items.filter(i => i.result?.exported?.fidelity?.checked && !i.result.exported.fidelity.ok);
+      if (bad.length) { agg.ok = false; agg.error = `export degraded in ${bad.length} of ${agg.result.total} file(s)`; }
+    }
+    show(agg, ctx); if (!agg.ok) process.exit(1);
+    return;
+  }
+  if (!outArg) {
+    show({ ok: false, error: 'missing output path', usage: 'blender-cli export <out.glb|obj|fbx|stl|ply|usd> [--blend f] [--selected] [--no-verify] [--strict]' }, ctx);
+    process.exit(1);
+  }
+  const r = runBlender(EXPORT_BODY, { blend: flags.blend, params: { out: resolve(outArg), selected: !!flags.selected, verify }, flags });
+  const fid = r?.result?.exported?.fidelity;
+  if (r.ok && flags.strict && fid?.checked && !fid.ok) {
+    r.ok = false;
+    r.error = `export degraded: ${fid.lost.map(l => `${l.field} ${l.scene} -> ${l.file}`).join(', ')}`;
+  }
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// `blender-cli verify [--blend f]` — lint the scene before you spend a render on
+// it. The earlier prototype was dropped because it called any two touching
+// bounding boxes an overlap, which is most of a normal scene; here an overlap
+// has to penetrate by more than --tolerance on ALL THREE axes before it counts,
+// and the depth is reported so the agent can judge for itself. Findings are
+// tiered error/warn/info and --fail-on decides which tier is worth a non-zero exit.
+const VERIFY_BODY = `from mathutils import Vector
+import math as _m
+sc = bpy.context.scene
+tol = float(PARAMS.get("tolerance") or 0.001)
+F = []
+def add(sev, check, detail, obj=None, **extra):
+    f = {"severity": sev, "check": check, "detail": detail}
+    if obj is not None: f["object"] = obj
+    f.update(extra)
+    F.append(f)
+
+objs = list(sc.objects)
+meshes = [o for o in objs if o.type == "MESH" and o.data]
+cams = [o for o in objs if o.type == "CAMERA"]
+lights = [o for o in objs if o.type == "LIGHT"]
+
+if not cams: add("error", "no_camera", "scene has no camera; render will fail")
+if not lights: add("info", "no_light", "scene has no light; Cycles/EEVEE output will be black unless the world lights it")
+
+def world_aabb(o):
+    cs = [o.matrix_world @ Vector(c) for c in o.bound_box]
+    return (Vector((min(c.x for c in cs), min(c.y for c in cs), min(c.z for c in cs))),
+            Vector((max(c.x for c in cs), max(c.y for c in cs), max(c.z for c in cs))))
+
+for o in objs:
+    vals = list(o.location) + list(o.rotation_euler) + list(o.scale)
+    if any(not _m.isfinite(v) for v in vals):
+        add("error", "non_finite_transform", "NaN/inf in transform; this object will corrupt exports and renders", o.name)
+        continue
+    if o.type == "MESH":
+        if len(o.data.vertices) == 0:
+            add("error", "empty_mesh", "mesh has no vertices", o.name)
+        if not o.data.materials or all(m is None for m in o.data.materials):
+            add("info", "no_material", "mesh has no material; renders with the default grey", o.name)
+    s = list(o.scale)
+    if any(abs(v) < 1e-9 for v in s):
+        add("error", "degenerate_scale", "a scale axis is zero; geometry is flattened", o.name, scale=[round(v, 6) for v in s])
+    elif any(v < 0 for v in s):
+        add("warn", "negative_scale", "negative scale flips normals; exporters and shading handle this inconsistently", o.name, scale=[round(v, 6) for v in s])
+    elif o.type == "MESH" and max(abs(v) for v in s) - min(abs(v) for v in s) > 1e-4:
+        add("warn", "non_uniform_scale", "unapplied non-uniform scale distorts normals, modifiers and physics; apply it before export", o.name, scale=[round(v, 6) for v in s])
+
+# Overlap: real interpenetration on every axis, not a shared face or edge.
+for i in range(len(meshes)):
+    for j in range(i + 1, len(meshes)):
+        a, b = meshes[i], meshes[j]
+        amin, amax = world_aabb(a); bmin, bmax = world_aabb(b)
+        depth = [min(amax[k], bmax[k]) - max(amin[k], bmin[k]) for k in range(3)]
+        if all(d > tol for d in depth):
+            add("warn", "overlap", "bounding boxes interpenetrate on all three axes", a.name,
+                other=b.name, depth=[round(d, 5) for d in depth], tolerance=tol)
+
+# Off-camera: project the 8 corners; an object is only off-frame if its whole
+# projected box misses [0,1]x[0,1]. Testing corners individually would flag any
+# object bigger than the frame, which is usually the hero object.
+if cams and sc.camera:
+    try:
+        from bpy_extras.object_utils import world_to_camera_view as _w2c
+        for o in meshes:
+            cs = [o.matrix_world @ Vector(c) for c in o.bound_box]
+            pts = [_w2c(sc, sc.camera, c) for c in cs]
+            front = [p for p in pts if p.z > 0]
+            if not front:
+                add("warn", "off_camera", "entirely behind the camera", o.name)
+                continue
+            xs = [p.x for p in front]; ys = [p.y for p in front]
+            if max(xs) < 0 or min(xs) > 1 or max(ys) < 0 or min(ys) > 1:
+                add("warn", "off_camera", "outside the camera frame", o.name,
+                    ndc_x=[round(min(xs), 3), round(max(xs), 3)], ndc_y=[round(min(ys), 3), round(max(ys), 3)])
+    except Exception as e:
+        add("info", "off_camera_skipped", "frustum check unavailable: %s" % e)
+
+counts = {"error": 0, "warn": 0, "info": 0}
+for f in F: counts[f["severity"]] += 1
+result["verified"] = {"scene": sc.name, "objects": len(objs), "meshes": len(meshes),
+    "tolerance": tol, "errors": counts["error"], "warnings": counts["warn"],
+    "infos": counts["info"], "findings": F}`;
+
+commands.verify = async (args, ctx) => {
+  const { flags } = fdn.parseArgs(args, ['blend', 'blender', 'timeout', 'tolerance', 'fail-on']);
+  const failOn = flags['fail-on'] || 'error';
+  if (!['error', 'warn', 'none'].includes(failOn)) {
+    show({ ok: false, error: `invalid --fail-on: ${failOn} (use error|warn|none)` }, ctx); process.exit(1);
+  }
+  if (flags.tolerance !== undefined && !(Number(flags.tolerance) >= 0)) {
+    show({ ok: false, error: `invalid --tolerance: ${flags.tolerance} (a non-negative number, e.g. 0.001)` }, ctx); process.exit(1);
+  }
+  const r = runBlender(VERIFY_BODY, { blend: flags.blend, params: { tolerance: flags.tolerance ?? null }, flags });
+  const v = r?.result?.verified;
+  if (r.ok && v && failOn !== 'none') {
+    const bad = failOn === 'warn' ? v.errors + v.warnings : v.errors;
+    if (bad > 0) { r.ok = false; r.error = `scene verify failed: ${v.errors} error(s), ${v.warnings} warning(s) (--fail-on ${failOn})`; }
+  }
   show(r, ctx); if (!r.ok) process.exit(1);
 };
 
@@ -738,22 +1131,38 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--huma
   exec "<bpy>"  [--blend f] [--save f] [--check] [--safe]   run agent-authored bpy; set result[...] keys -> JSON back
   run <script.py> [--blend f] [--save f] [--check] [--safe] same, from a .py file
   scene [--blend f]            dump objects / frame range / engine / materials / keyframes as JSON
+  verify [--blend f] [--tolerance 0.001] [--fail-on error|warn|none]
+                               lint the scene before you spend a render on it: missing camera,
+                               empty meshes, NaN/degenerate transforms, unapplied non-uniform
+                               scale, off-camera objects, real (not merely touching) overlaps
   import <file> [--blend f] [--save f]   pull an asset in: glb gltf obj fbx stl ply usd abc dae
   import polyhaven:<id> [--type hdri|texture|model] [--res 1k|2k|4k]   fetch + import a Poly Haven asset
          (model -> objects, hdri -> world environment, texture -> wired PBR material; cached in ~/.cache)
+  import --batch "assets/*.glb" [--save f]   gather many files into ONE scene
   generate "<prompt>" [--out f.glb] [--import] [--wait sec]  text-to-3D via Meshy (needs MESHY_API_KEY)
-  export <out.glb> [--blend f] [--selected]  hand the scene on: glb gltf obj fbx stl ply usd
+  generate --image ref.png [--out f.glb] [--import]          image-to-3D from a reference photo
+  export <out.glb> [--blend f] [--selected] [--no-verify] [--strict]
+                               hand the scene on: glb gltf obj fbx stl ply usd. Reads the file
+                               BACK and reports a fidelity census (verts/materials/uv/colour
+                               attrs/shape keys), compared only on what the format can carry.
+  export <out-dir> --batch "blends/*.blend" --format glb     one export per .blend
   render [--blend f] --out preview.png [--frame N] [--res 1280x720]
          [--engine cycles|eevee|workbench] [--device cpu|cuda|optix|metal|hip|oneapi] [--samples N] [--denoise on|off]
   render --animation --out clip.mp4 [--frames 1..48] [--fps 24] [...]  render the frame range
          (MP4/MOV/WEBM via Blender's ffmpeg, or a PNG sequence for any other --out)
+  render --batch "shots/*.blend" --out renders/ [--ext png]  one render per .blend
   version                      print name + version
 
 Guardrails: --check compiles agent code + flags risky calls without executing;
 --safe REFUSES code that trips the AST gate (banned imports/calls, write-mode open;
 set BLENDER_CLI_SAFE=1 to make it the default, --unsafe to override);
 --timeout <sec> kills a hung Blender instead of hanging your agent.
-Env: BLENDER_BIN overrides the binary (auto-detected on macOS / Linux / snap / flatpak / Windows).
+Batch: quote the pattern (* and ? in the last segment, no **); every file runs and
+failures are reported per item, with a non-zero exit if any failed.
+Env: BLENDER_BIN overrides the binary (auto-detected on macOS / Linux / snap / flatpak /
+Windows incl. Steam, Store, scoop and choco layouts).
+Blender: doctor reports "tested" only for versions this release was actually run against
+(see tested_versions); anything else reports "untested" rather than claiming support.
 The agent writes bpy for building/animating; the CLI runs it deterministically and reports state.`);
 };
 

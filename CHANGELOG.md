@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0 (2026-07-25)
+
+Blender 5.x support, and a release theme of **trust the output**: 0.1.0 and 0.2.0 built the pipeline (import, generate, render, export), and this one makes what comes out of it checkable. Six items, each mined from cited, recent pain in the agent-Blender ecosystem, and the whole surface is now exercised by a smoke suite run against both Blender 4.3.2 and 5.2.0.
+
+### Added
+
+- **Blender 5.x support, actually tested.** The suite runs green on 4.3.2 and 5.2.0, and `TESTED_VERSIONS` lists only versions it was really run against. `doctor` now reports `tested` or `untested` and never `supported` for a version nobody exercised, plus the matrix itself as `tested_versions`.
+- `verify [--blend f] [--tolerance 0.001] [--fail-on error|warn|none]`: lint a scene before spending a render on it. Errors for a missing camera, empty meshes, NaN/infinite transforms and degenerate (zero) scale; warnings for negative and unapplied non-uniform scale, off-camera objects, and real overlaps; info for missing materials and lights. Two objects merely touching are **not** an overlap: interpenetration has to exceed `--tolerance` on all three axes, and the depth is reported so you can judge. (This is the redesign of the check deliberately dropped in 0.2.0 for being too noisy to act on.)
+- **Export fidelity census.** `export` now reads the written file back into an empty scene and compares it against what went in, reporting `fidelity` with per-field scene-vs-file counts for meshes, verts, materials, UV layers, colour attributes and shape keys. Comparison is scoped to what each container can actually carry, so STL is never accused of losing materials it cannot hold. `--no-verify` skips the readback, `--strict` makes a degraded export a non-zero exit.
+- `generate --image <ref.png|jpg|webp>`: image-to-3D from a reference photo, alongside the existing text-to-3D. Shares the polling, download and `--import` path; a text prompt given with `--image` is passed as the texture prompt.
+- **Batch mode.** `render --batch "shots/*.blend" --out renders/ [--ext png]` and `export <out-dir> --batch "blends/*.blend" --format glb` run one file at a time and name each output after its source; `import --batch "assets/*.glb"` gathers many files into a single scene. Every item runs even if an earlier one fails, each result is reported per file, and the exit code is non-zero if any failed. `*` and `?` in the last path segment; no `**`.
+- `doctor` reports `cycles_denoiser`, so a build with no OpenImageDenoise is visible before a render fails rather than after.
+- `test/smoke.mjs`: 35 end-to-end checks against a real Blender (`node test/smoke.mjs [--blender <path>]`). This is what backs the tested-version matrix.
+
+### Fixed
+
+- **`render --engine eevee` was broken on Blender 5.x.** EEVEE shipped as `BLENDER_EEVEE`, gained `BLENDER_EEVEE_NEXT` in 4.2, then took the plain name back in 5.0 — and the hardcoded identifier meant every EEVEE render on 5.x died with `enum "BLENDER_EEVEE_NEXT" not found`. The engine is now resolved from the enum the running build advertises, so the next rename is survivable too. `doctor` had been calling 5.x "supported (tested on 4.3)" the whole time.
+- **Cycles renders failed outright on builds without OpenImageDenoise.** Denoising is on by Blender's default and a build compiled without OIDN then aborts the render with "Failed to denoise", never hinting the setting was optional — which is how most distro packages ship, so a plain `render --engine cycles` on a server was dead on arrival. Denoising now stands down automatically when no denoiser exists (reported in the result), while an explicit `--denoise on` fails with an error that says why.
+- Blender no longer inherits the agent's stdin. A child holding an inherited stdin pipe can block forever waiting on input nobody sends — the classic headless hang on Windows, where `--timeout` was the only thing ending the call.
+- Windows binary discovery now also covers Steam, Microsoft Store, scoop and Chocolatey layouts, not just `Program Files\Blender Foundation`.
+- EEVEE sample counts are located by probing the build rather than assuming `taa_render_samples`.
+
 ## 0.2.0 (2026-07-18)
 
 Ports the remaining unique features from the experimental TypeScript branch into the canonical zero-dependency implementation, with the known gaps in that branch fixed. The TS branch is archived as tag `archive/ts-rewrite`.
