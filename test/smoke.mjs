@@ -11,7 +11,7 @@
 // matrix in the CLI: a version is only listed there once this suite passes on it.
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, existsSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,11 +26,16 @@ const WORK = mkdtempSync(join(tmpdir(), 'bcli-smoke-'));
 let pass = 0, fail = 0;
 const failures = [];
 
-function cli(args, { timeout = 180000 } = {}) {
+// Detached jobs land in a throwaway directory so the suite never touches the
+// real ~/.cache/blender-cli/jobs of whoever runs it.
+const JOBS = join(WORK, 'jobs');
+
+function cli(args, { timeout = 180000, env = null } = {}) {
   const full = BLENDER ? [...args, '--blender', BLENDER] : args;
   const r = spawnSync(process.execPath, [CLI, ...full], {
     encoding: 'utf8', timeout, maxBuffer: 64 * 1024 * 1024, cwd: WORK,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, BLENDER_CLI_JOBS_DIR: JOBS, ...(env || {}) },
   });
   let json = null;
   try { json = JSON.parse(r.stdout); } catch { /* non-JSON is itself a failure the check will catch */ }
@@ -358,6 +363,343 @@ check('generate --image rejects an unsupported image format', () => {
 check('generate with neither prompt nor --image explains itself', () => {
   const r = cli(['generate']);
   return r.code !== 0 && /missing prompt/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+// --- 0.4.0: version-aware animation, API drift guard, doctor api ----------------
+const ANIM = join(WORK, 'anim.blend');
+check('scene reports keyframe counts on an animated file (slotted or legacy actions)', () => {
+  cli(['exec', 'o = bpy.data.objects["Cube"]\no.keyframe_insert("location", frame=1)\no.location.x = 3\no.keyframe_insert("location", frame=10)',
+    '--blend', BLEND, '--save', ANIM]);
+  const r = cli(['scene', '--blend', ANIM]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const cube = r.json.result.objects.find(o => o.name === 'Cube');
+  if (!cube) return 'no Cube in scene';
+  if (cube.fcurves !== 3) return `expected 3 fcurves, got ${cube.fcurves}`;
+  if (cube.keyframes !== 6) return `expected 6 keyframes, got ${cube.keyframes}`;
+  return JSON.stringify(cube.frames) === JSON.stringify([1, 10]) ? true : `frames ${JSON.stringify(cube.frames)}`;
+});
+
+check('exec --check reports only the API drift that applies to this build', () => {
+  const r = cli(['exec', 'n = len(o.animation_data.action.fcurves)\no.keyframe_insert("rotation")\nsc.render.engine = "BLENDER_EEVEE"', '--check']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const ids = (r.json.result.api_drift || []).map(d => d.id);
+  const [maj, min] = r.json.result.bpy_version || [];
+  if (!ids.includes('rotation-data-path')) return `version-independent row missing: ${ids}`;
+  if (maj >= 5 && !ids.includes('action-fcurves')) return `5.x build but action-fcurves not flagged: ${ids}`;
+  if (maj < 5 && ids.includes('action-fcurves')) return `pre-5.0 build but action-fcurves flagged: ${ids}`;
+  const legacyEevee = maj === 4 && min >= 2;
+  if (legacyEevee && !ids.includes('eevee-legacy-id')) return '4.2-4.5 build but eevee-legacy-id not flagged';
+  if (!legacyEevee && ids.includes('eevee-legacy-id')) return 'eevee-legacy-id flagged outside 4.2-4.5';
+  return true;
+});
+
+check('a failed exec carries the matching drift hint', () => {
+  const r = cli(['exec', 'bpy.ops.import_scene.obj(filepath="x.obj")']);
+  if (r.code === 0) return 'a removed operator succeeded?';
+  const [maj] = r.json?.bpy_version || [];
+  if (maj < 4) return true; // still exists there, so no hint is the right answer
+  const ids = (r.json?.api_drift || []).map(d => d.id);
+  return ids.includes('import-scene-obj') ? true : `no hint: ${JSON.stringify(r.json?.api_drift)}`;
+});
+
+check('doctor reports the API generation and enabled add-ons', () => {
+  const r = cli(['doctor']);
+  const api = r.json?.api;
+  if (!api) return 'no api block';
+  if (!['slotted', 'legacy'].includes(api.actions)) return `actions: ${api.actions}`;
+  if (!['compositing_node_group', 'node_tree'].includes(api.compositor)) return `compositor: ${api.compositor}`;
+  return Array.isArray(r.json.addons_enabled) ? true : 'no addons_enabled';
+});
+
+// --- 0.4.0: add / keyframe / material verbs -----------------------------------
+const VERBS = join(WORK, 'verbs.blend');
+check('add builds a named primitive at a position', () => {
+  cli(['new', 'verbs', '--save', VERBS]);
+  const r = cli(['add', 'cube', '--name', 'Box', '--at', '1,2,3', '--size', '1', '--rot', '0,0,45', '--blend', VERBS, '--save', VERBS]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const a = r.json.result.added?.[0];
+  if (a?.name !== 'Box') return `name ${a?.name}`;
+  if (JSON.stringify(a.location) !== JSON.stringify([1, 2, 3])) return `location ${JSON.stringify(a.location)}`;
+  return Math.abs(a.rotation_deg[2] - 45) < 0.01 ? true : `rotation ${JSON.stringify(a.rotation_deg)}`;
+});
+
+check('add --json builds several objects in one launch', () => {
+  const ops = [{ what: 'sphere', name: 'Ball', at: [3, 0, 0] }, { what: 'light', type: 'sun', name: 'Sun', energy: 3, color: '#ff8800' },
+    { what: 'camera', name: 'Cam2', at: [6, -6, 4], look_at: [0, 0, 0] }, { what: 'text', name: 'Label', text: 'hi' }];
+  const r = cli(['add', '--json', JSON.stringify(ops), '--blend', VERBS, '--save', VERBS]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const names = r.json.result.added.map(a => a.name);
+  if (JSON.stringify(names) !== JSON.stringify(['Ball', 'Sun', 'Cam2', 'Label'])) return `names ${names}`;
+  const s = cli(['scene', '--blend', VERBS]).json?.result;
+  return s?.lights?.includes('Sun') && s?.cameras?.includes('Cam2') ? true : 'scene does not list the new light/camera';
+});
+
+check('add rejects an unknown kind (exit 1)', () => {
+  const r = cli(['add', 'banana', '--blend', VERBS]);
+  return r.code !== 0 && /unknown object kind/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+check('keyframe inserts keys, honours --interp and extends the frame range', () => {
+  const a = cli(['keyframe', 'Box', '--prop', 'location', '--frame', '1', '--value', '1,2,3', '--blend', VERBS, '--save', VERBS]);
+  if (!a.json?.ok) return a.json?.error || 'first key not ok';
+  const b = cli(['keyframe', 'Box', '--prop', 'location', '--frame', '300', '--value', '5,2,3', '--interp', 'linear', '--blend', VERBS, '--save', VERBS]);
+  if (!b.json?.ok) return b.json?.error || 'second key not ok';
+  if (b.json.result.frame_end_extended !== 300) return `frame_end_extended ${b.json.result.frame_end_extended}`;
+  const anim = b.json.result.animation?.Box;
+  return anim?.keyframes === 6 && anim.fcurves === 3 ? true : `animation ${JSON.stringify(anim)}`;
+});
+
+check('keyframe --json batches keys, including a dotted data path', () => {
+  const ops = [{ object: 'Box', prop: 'rotation', frame: 1, value: [0, 0, 0] }, { object: 'Box', prop: 'rotation', frame: 60, value: [0, 0, 360] },
+    { object: 'Sun', prop: 'data.energy', frame: 1, value: 3 }, { object: 'Sun', prop: 'data.energy', frame: 30, value: 9 }];
+  const r = cli(['keyframe', '--json', JSON.stringify(ops), '--blend', VERBS, '--save', VERBS]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  if (r.json.result.keyed?.length !== 4) return `keyed ${r.json.result.keyed?.length}`;
+  const sun = r.json.result.animation?.Sun;
+  return sun?.data?.keyframes === 2 ? true : `Sun data keys: ${JSON.stringify(sun)}`;
+});
+
+check('keyframe names a missing object loudly (exit 1)', () => {
+  const r = cli(['keyframe', 'Nope', '--frame', '1', '--blend', VERBS]);
+  return r.code !== 0 && /no object named/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+check('material assigns a Principled material using the 4.0+ socket names', () => {
+  const r = cli(['material', 'Box', '--color', '#cc2222', '--roughness', '0.3', '--metallic', '1', '--emission', '0.1,0.1,0.8', '--blend', VERBS, '--save', VERBS]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const m = r.json.result.material;
+  if (m.inputs?.base_color !== 'Base Color') return `inputs ${JSON.stringify(m.inputs)}`;
+  if (!m.inputs.emission) return 'emission not set';
+  const s = cli(['scene', '--blend', VERBS]).json?.result;
+  return s?.materials?.includes(m.name) ? true : `scene materials ${JSON.stringify(s?.materials)}`;
+});
+
+// --- 0.4.0: render --device auto / --threads ------------------------------------
+check('render --device auto picks a Cycles device and reports it', () => {
+  const r = cli(['render', '--blend', BLEND, '--out', join(WORK, 'auto.png'), '--engine', 'cycles', '--device', 'auto', '--samples', '4', '--res', '96x72']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const d = r.json.result?.device;
+  if (!d || d.requested !== 'auto') return `device ${JSON.stringify(d)}`;
+  return ['OPTIX', 'CUDA', 'HIP', 'METAL', 'ONEAPI', 'CPU'].includes(d.type) ? true : `type ${d.type}`;
+});
+
+check('render --threads N is honoured and reported', () => {
+  const r = cli(['render', '--blend', BLEND, '--out', join(WORK, 'threads.png'), '--engine', 'eevee', '--samples', '4', '--res', '96x72', '--threads', '2']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  return r.json.result?.threads === 2 ? true : `threads ${r.json.result?.threads}`;
+});
+
+check('render rejects a bad --threads value', () => {
+  const r = cli(['render', '--blend', BLEND, '--out', join(WORK, 'x.png'), '--threads', '0']);
+  return r.code !== 0 && /invalid --threads/.test(r.json?.error || '') ? true : 'accepted --threads 0';
+});
+
+// --- 0.4.0: verify mesh health --------------------------------------------------
+const MESHES = join(WORK, 'meshes.blend');
+check('verify flags a concave UCX_ collider and passes a convex one', () => {
+  cli(['exec', 'bpy.ops.wm.read_factory_settings(use_empty=True)\n' +
+    'import bmesh\n' +
+    'def mk(name, loc):\n' +
+    '    me = bpy.data.meshes.new(name); ob = bpy.data.objects.new(name, me); bpy.context.scene.collection.objects.link(ob); ob.location = loc\n' +
+    '    bm = bmesh.new(); bmesh.ops.create_cube(bm, size=1.0); bm.to_mesh(me); bm.free(); return ob\n' +
+    'mk("UCX_Good", (0, 0, 0))\n' +
+    'b = mk("UCX_Bad", (5, 0, 0)); b.data.vertices[0].co = (0.1, 0.1, 0.1)\n' +
+    'c = mk("Loose", (10, 0, 0)); bm = bmesh.new(); bm.from_mesh(c.data); [bm.verts.new((9.0 + i, 0.0, 0.0)) for i in range(3)]; bm.to_mesh(c.data); bm.free()\n' +
+    'd = mk("Mods", (15, 0, 0)); d.modifiers.new("Multires", "MULTIRES"); d.modifiers.new("Subsurf", "SUBSURF")\n' +
+    'e = mk("Flipped", (20, 0, 0)); e.data.flip_normals()\n' +
+    'cam = bpy.data.objects.new("Cam", bpy.data.cameras.new("Cam")); bpy.context.scene.collection.objects.link(cam); bpy.context.scene.camera = cam',
+  '--save', MESHES]);
+  const r = cli(['verify', '--blend', MESHES, '--fail-on', 'none']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const f = r.json.result.verified.findings;
+  const has = (obj, chk) => f.some(x => x.object === obj && x.check === chk);
+  if (!has('UCX_Bad', 'concave_collider')) return 'concave collider not flagged';
+  if (has('UCX_Good', 'concave_collider')) return 'convex collider falsely flagged';
+  return r.json.result.verified.mesh?.UCX_Good?.convex === true ? true : 'no convex stat on the good collider';
+});
+
+check('verify flags loose geometry, inverted normals and Multires-not-last', () => {
+  const r = cli(['verify', '--blend', MESHES, '--fail-on', 'none']);
+  const f = r.json?.result?.verified?.findings || [];
+  const has = (obj, chk) => f.some(x => x.object === obj && x.check === chk);
+  if (!has('Loose', 'loose_geometry')) return 'loose_geometry missing';
+  if (!has('Flipped', 'inverted_normals')) return 'inverted_normals missing';
+  if (!has('Mods', 'multires_not_last')) return 'multires_not_last missing';
+  return has('UCX_Good', 'loose_geometry') || has('UCX_Good', 'inverted_normals') ? 'clean cube falsely flagged' : true;
+});
+
+check('verify --no-mesh skips the mesh pass', () => {
+  const r = cli(['verify', '--blend', MESHES, '--fail-on', 'none', '--no-mesh']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  if (r.json.result.verified.findings.some(x => x.check === 'concave_collider')) return 'mesh finding present despite --no-mesh';
+  return Object.keys(r.json.result.verified.mesh || {}).length === 0 ? true : 'mesh stats present';
+});
+
+// --- 0.4.0: export animation census ---------------------------------------------
+// No lights in this fixture: Blender 5.1's own FBX importer trips on lights
+// during the readback, which would mask what the census is being asked to prove.
+const ANIM_NOLIGHT = join(WORK, 'anim_nolight.blend');
+check('export glb carries animation through the census', () => {
+  cli(['exec', 'bpy.ops.wm.read_factory_settings(use_empty=True)\nbpy.ops.mesh.primitive_cube_add()\no = bpy.context.object\no.keyframe_insert("location", frame=1)\no.location.x = 3\no.keyframe_insert("location", frame=10)',
+    '--save', ANIM_NOLIGHT]);
+  const r = cli(['export', join(WORK, 'anim.glb'), '--blend', ANIM_NOLIGHT]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const e = r.json.result.exported;
+  if (e.animation?.objects !== 1) return `animation block ${JSON.stringify(e.animation)}`;
+  const fid = e.fidelity;
+  if (!fid?.checked) return `not checked: ${fid?.reason}`;
+  if (!fid.compared.includes('animated')) return 'animated not compared';
+  return fid.ok && fid.file.animated === 1 ? true : `fidelity ${JSON.stringify(fid)}`;
+});
+
+check('export fbx carries animation through the census', () => {
+  const r = cli(['export', join(WORK, 'anim.fbx'), '--blend', ANIM_NOLIGHT]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const fid = r.json.result.exported.fidelity;
+  if (!fid?.checked) return `not checked: ${fid?.reason}`;
+  if (!fid.compared.includes('animated')) return 'animated not compared';
+  return fid.ok && fid.file.animated === 1 ? true : `fidelity ${JSON.stringify(fid)}`;
+});
+
+check('export usd is not judged on animation it cannot read back', () => {
+  const r = cli(['export', join(WORK, 'anim.usd'), '--blend', ANIM_NOLIGHT]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const fid = r.json.result.exported.fidelity;
+  if (!fid?.checked) return `not checked: ${fid?.reason}`;
+  if (fid.compared.includes('animated')) return 'usd compared on animation';
+  return fid.ok ? true : `degraded ${JSON.stringify(fid.lost)}`;
+});
+
+check('export --animations off drops animation and says so', () => {
+  const r = cli(['export', join(WORK, 'anim_off.glb'), '--blend', ANIM_NOLIGHT, '--animations', 'off']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const e = r.json.result.exported;
+  if (e.animation?.exported !== false) return `exported flag ${JSON.stringify(e.animation)}`;
+  if (e.fidelity.compared.includes('animated')) return 'still compared on animation';
+  return e.fidelity.ok ? true : `degraded ${JSON.stringify(e.fidelity.lost)}`;
+});
+
+// --- 0.4.0: snapshot --------------------------------------------------------------
+check('snapshot tiles four views and reports per-view coverage', () => {
+  const out = join(WORK, 'sheet.png');
+  const r = cli(['snapshot', '--blend', BLEND, '--out', out, '--res', '96x72']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const s = r.json.result.snapshot;
+  if (!existsSync(out)) return 'no sheet written';
+  if (JSON.stringify(s.grid) !== JSON.stringify([2, 2])) return `grid ${JSON.stringify(s.grid)}`;
+  if (s.views.length !== 4) return `views ${s.views.length}`;
+  const bad = s.views.filter(v => !(v.coverage > 0 && v.coverage < 1) || v.blank || !v.bbox);
+  return bad.length ? `bad views ${JSON.stringify(bad)}` : true;
+});
+
+check('snapshot on a scene with nothing visible fails loudly', () => {
+  const empty = join(WORK, 'empty.blend');
+  cli(['exec', 'bpy.ops.wm.read_factory_settings(use_empty=True)', '--save', empty]);
+  const r = cli(['snapshot', '--blend', empty, '--out', join(WORK, 'empty.png')]);
+  return r.code !== 0 && /nothing to snapshot/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+check('snapshot rejects an unknown view', () => {
+  const r = cli(['snapshot', '--blend', BLEND, '--out', join(WORK, 'v.png'), '--views', 'front,sideways']);
+  return r.code !== 0 && /unknown view/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+// --- 0.4.0: detached jobs -------------------------------------------------------
+check('render --detach returns a job id at once; job wait collects result and progress', () => {
+  const r = cli(['render', '--blend', BLEND, '--animation', '--frames', '1..3', '--out', join(WORK, 'jobseq'), '--engine', 'eevee', '--samples', '4', '--res', '96x72', '--detach']);
+  if (!r.json?.ok || !r.json.job) return r.json?.error || 'no job id';
+  const w = cli(['job', 'wait', r.json.job, '--timeout', '170', '--poll', '1']);
+  if (!w.json?.ok) return w.json?.error || 'wait not ok';
+  if (w.json.status !== 'done') return `status ${w.json.status}`;
+  if (w.json.result?.frame_files !== 3) return `frame_files ${w.json.result?.frame_files}`;
+  if (w.json.progress?.frames_done !== 3 || w.json.progress?.percent !== 100) return `progress ${JSON.stringify(w.json.progress)}`;
+  const l = cli(['job', 'list']);
+  return l.json?.jobs?.some(j => j.job === r.json.job && j.status === 'done') ? true : 'job list does not show it done';
+});
+
+check('job cancel stops a running render', () => {
+  const r = cli(['render', '--blend', BLEND, '--animation', '--frames', '1..200', '--out', join(WORK, 'jobseq2'), '--engine', 'cycles', '--samples', '64', '--res', '256x256', '--detach']);
+  if (!r.json?.job) return r.json?.error || 'no job id';
+  const c = cli(['job', 'cancel', r.json.job]);
+  if (!c.json?.ok) return c.json?.error || 'cancel not ok';
+  if (c.json.was !== 'running') return `job was already ${c.json.was}`;
+  const s = cli(['job', 'status', r.json.job]);
+  return s.json?.status === 'cancelled' ? true : `status ${s.json?.status}`;
+});
+
+check('job status on an unknown id fails (exit 1)', () => {
+  const r = cli(['job', 'status', 'no-such-job']);
+  return r.code !== 0 && /unknown job/.test(r.json?.error || '') ? true : 'unknown job accepted';
+});
+
+check('--detach and --batch refuse to combine', () => {
+  const r = cli(['render', '--batch', join(WORK, 'b_*.blend'), '--out', WORK, '--detach']);
+  return r.code !== 0 && /cannot be combined/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+// --- 0.4.0: add-ons, headless ---------------------------------------------------
+// Isolated preferences, so the host's Blender install is never touched.
+const PREFS = join(WORK, 'prefs');
+const ISO = { BLENDER_USER_RESOURCES: PREFS, BLENDER_USER_CONFIG: join(PREFS, 'config'), BLENDER_USER_SCRIPTS: join(PREFS, 'scripts') };
+check('addon install --enable installs a legacy add-on and enables it', () => {
+  mkdirSync(PREFS, { recursive: true });
+  const tiny = join(WORK, 'tiny_smoke.py');
+  writeFileSync(tiny, 'bl_info = {"name": "Tiny Smoke", "author": "smoke", "version": (0, 1), "blender": (3, 0, 0), "category": "Development"}\ndef register(): pass\ndef unregister(): pass\n');
+  const r = cli(['addon', 'install', tiny, '--enable'], { env: ISO });
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  if (r.json.result.installed?.module !== 'tiny_smoke') return `module ${JSON.stringify(r.json.result.installed)}`;
+  return r.json.result.enabled === true ? true : 'not enabled';
+});
+
+check('addon list shows it enabled in a fresh session (the enable persisted)', () => {
+  const r = cli(['addon', 'list'], { env: ISO });
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const it = r.json.result.addons.find(a => a.module === 'tiny_smoke');
+  return it?.enabled ? true : `tiny_smoke ${JSON.stringify(it)}`;
+});
+
+check('--addons enables a module for one call', () => {
+  const r = cli(['exec', 'result["on"] = "tiny_smoke" in bpy.context.preferences.addons', '--addons', 'tiny_smoke'], { env: ISO });
+  return r.json?.ok && r.json.result?.on === true ? true : `unexpected: ${JSON.stringify(r.json)}`;
+});
+
+check('--addons fails loudly on a missing module (exit 1)', () => {
+  const r = cli(['exec', 'result["x"] = 1', '--addons', 'no_such_addon_xyz'], { env: ISO });
+  return r.code !== 0 && /not available/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+check('--addons rejects a value with spaces', () => {
+  const r = cli(['exec', 'result["x"] = 1', '--addons', 'a b']);
+  return r.code !== 0 && /invalid --addons/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+check('addon disable turns it off; list --all still shows it installed', () => {
+  const d = cli(['addon', 'disable', 'tiny_smoke'], { env: ISO });
+  if (!d.json?.ok || d.json.result.enabled !== false) return d.json?.error || 'disable not ok';
+  const r = cli(['addon', 'list', '--all'], { env: ISO });
+  const it = r.json?.result?.addons?.find(a => a.module === 'tiny_smoke');
+  return it && it.enabled === false ? true : `after disable: ${JSON.stringify(it)}`;
+});
+
+// --- 0.4.0: schema ------------------------------------------------------------------
+const ALL_COMMANDS = ['doctor', 'new', 'exec', 'run', 'scene', 'verify', 'snapshot', 'add', 'keyframe', 'material', 'import', 'generate', 'export', 'render', 'job', 'addon', 'schema', 'version'];
+check('schema lists exactly the command surface, each with a known effects annotation', () => {
+  const r = cli(['schema'], { timeout: 20000 });
+  if (!r.json?.commands) return 'no commands in schema';
+  const spec = r.json.commands.map(c => c.name).sort();
+  if (JSON.stringify(spec) !== JSON.stringify([...ALL_COMMANDS].sort())) return `spec set differs: ${spec}`;
+  const help = cli(['help'], { timeout: 20000 }).stderr;
+  const missing = spec.filter(n => !new RegExp(`^\\s+${n}\\b`, 'm').test(help));
+  if (missing.length) return `in schema but not in help: ${missing}`;
+  const bad = r.json.commands.filter(c => !c.effects?.length || c.effects.some(e => !r.json.effects_legend[e]));
+  return bad.length ? `bad effects on ${bad.map(c => c.name)}` : true;
+});
+
+check('schema --skill renders a skill file with frontmatter and every command', () => {
+  const r = cli(['schema', '--skill'], { timeout: 20000 });
+  if (!r.stdout.startsWith('---\nname: blender-cli')) return 'no frontmatter';
+  const missing = ALL_COMMANDS.filter(n => !r.stdout.includes(`blender-cli ${n}`));
+  return missing.length ? `missing ${missing}` : true;
 });
 
 // --- report ------------------------------------------------------------------

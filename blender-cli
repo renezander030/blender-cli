@@ -5,8 +5,8 @@
 // Built on cli-foundation (see foundation.js for the primitives used here).
 
 import * as fdn from './foundation.js';
-import { spawnSync } from 'node:child_process';
-import { writeFileSync, existsSync, readFileSync, mkdtempSync, readdirSync, mkdirSync, statSync } from 'node:fs';
+import { spawnSync, spawn } from 'node:child_process';
+import { writeFileSync, existsSync, readFileSync, mkdtempSync, readdirSync, mkdirSync, statSync, openSync, closeSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve, dirname, basename, sep } from 'node:path';
 
@@ -16,6 +16,99 @@ const PKG = JSON.parse(readFileSync(join(DIR, 'package.json'), 'utf8'));
 
 // Consistent output: terse JSON line by default, pretty JSON with -H/--human.
 const show = (r, ctx) => fdn.emit(r, { human: ctx?.human, table: () => JSON.stringify(r, null, 2) });
+
+// Flags every Blender-running command accepts: --blender <path>, --timeout <sec>
+// and --addons a,b (enable add-ons/extensions for this one call).
+const COMMON_FLAGS = ['blender', 'timeout', 'addons'];
+
+function parseAddons(flags) {
+  if (flags.addons === undefined) return null;
+  if (flags.addons === true || !String(flags.addons).trim()) return { error: 'missing value for --addons (comma-separated module names, no spaces)' };
+  const list = String(flags.addons).split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.length || list.some(s => /\s/.test(s))) return { error: `invalid --addons value: ${flags.addons} (module names, comma-separated, no spaces)` };
+  return { list };
+}
+
+// Version-aware F-curve access, prepended to every body that reads animation.
+// Blender 4.4 introduced slotted actions and 5.0 removed the legacy
+// Action.fcurves entirely, so the one-liner that worked on 4.3 raises
+// AttributeError on 5.x. This reads whichever API the running build has.
+const FCURVES_HELPER = `def _fcurves(o):
+    ad = getattr(o, "animation_data", None)
+    act = ad.action if ad else None
+    if act is None: return []
+    layers = getattr(act, "layers", None)
+    if layers is not None and len(layers):
+        out = []
+        slot = getattr(ad, "action_slot", None)
+        want = getattr(slot, "handle", None)
+        for layer in layers:
+            for strip in layer.strips:
+                for cb in strip.channelbags:
+                    have = getattr(cb, "slot_handle", None)
+                    if want is None or have is None or have == want: out.extend(cb.fcurves)
+        return out
+    return list(getattr(act, "fcurves", None) or [])
+def _anim_summary(o):
+    fcs = _fcurves(o)
+    frames = sorted(set(int(round(kp.co.x)) for fc in fcs for kp in fc.keyframe_points))
+    return {"fcurves": len(fcs), "keyframes": sum(len(fc.keyframe_points) for fc in fcs),
+        "frames": ([frames[0], frames[-1]] if frames else None)}
+`;
+
+// Known bpy API moves, keyed to the Blender version they landed in. exec --check
+// reports the rows that apply to the build in use, and a failed exec appends the
+// matching hints. The 5.x rows were verified against a real 5.1.1 build; the
+// older ones come from Blender's release notes.
+const API_DRIFT = [
+  { id: 'action-fcurves', since: [5, 0], severity: 'error', pattern: '\\.action\\.fcurves\\b|\\bactions\\[[^\\]]*\\]\\.fcurves\\b',
+    message: 'Action.fcurves is gone in 5.0+ (slotted actions since 4.4): F-curves live in action.layers[].strips[].channelbags[]',
+    hint: 'iterate action.layers[0].strips[0].channelbag(obj.animation_data.action_slot).fcurves, or let blender-cli scene / keyframe read them' },
+  { id: 'scene-node-tree', since: [5, 0], severity: 'error', pattern: '\\b(scene|sc|scn)\\.node_tree\\b',
+    message: 'Scene.node_tree was removed in 5.0; the compositor tree is scene.compositing_node_group', hint: 'scene.compositing_node_group' },
+  { id: 'use-nodes-assignment', since: [5, 0], severity: 'info', pattern: '\\.use_nodes\\s*=\\s*True',
+    message: 'Material/World .use_nodes is deprecated in 5.x (removal planned for 6.0): node trees are always on', hint: 'drop the assignment and use .node_tree directly' },
+  { id: 'import-scene-obj', since: [4, 0], severity: 'error', pattern: 'bpy\\.ops\\.(import|export)_scene\\.obj\\b',
+    message: 'import_scene.obj / export_scene.obj were removed in 4.0', hint: 'bpy.ops.wm.obj_import(filepath=...) / bpy.ops.wm.obj_export(filepath=...)' },
+  { id: 'import-mesh-stl-ply', since: [4, 2], severity: 'error', pattern: 'bpy\\.ops\\.(import|export)_mesh\\.(stl|ply)\\b',
+    message: 'import_mesh.stl/ply and export_mesh.stl/ply are gone (the Python STL/PLY add-ons were removed in 4.2)', hint: 'bpy.ops.wm.stl_import / stl_export / ply_import / ply_export' },
+  { id: 'eevee-next-id', since: [5, 0], severity: 'error', pattern: 'BLENDER_EEVEE_NEXT',
+    message: 'BLENDER_EEVEE_NEXT is not an engine in 5.0+; EEVEE took the plain name back', hint: 'sc.render.engine = "BLENDER_EEVEE", or blender-cli render --engine eevee (resolved per build)' },
+  { id: 'eevee-legacy-id', since: [4, 2], until: [5, 0], severity: 'error', pattern: '["\']BLENDER_EEVEE["\']',
+    message: 'BLENDER_EEVEE is not an engine on 4.2-4.5 (it is BLENDER_EEVEE_NEXT there)', hint: 'BLENDER_EEVEE_NEXT, or blender-cli render --engine eevee' },
+  { id: 'eevee-legacy-settings', since: [4, 2], severity: 'error', pattern: '\\.eevee\\.(use_ssr|use_gtao|use_bloom|use_ssr_refraction|use_soft_shadows)\\b',
+    message: 'EEVEE Next (4.2+) dropped use_ssr / use_gtao / use_bloom / use_soft_shadows; reflections and AO are raytraced, bloom is a compositor Glare node', hint: 'sc.eevee.use_raytracing = True; bloom via the compositor Glare node' },
+  { id: 'principled-4-renames', since: [4, 0], severity: 'error', pattern: '\\.inputs\\[["\'](Emission|Specular|Subsurface|Transmission|Clearcoat|Sheen)["\']\\]',
+    message: 'Principled BSDF sockets were renamed in 4.0: Emission -> Emission Color, Specular -> Specular IOR Level, Subsurface -> Subsurface Weight, Transmission -> Transmission Weight, Clearcoat -> Coat Weight, Sheen -> Sheen Weight', hint: 'use the 4.0 socket names (blender-cli material does)' },
+  { id: 'context-override-dict', since: [4, 0], severity: 'error', pattern: 'bpy\\.ops\\.\\w+\\.\\w+\\(\\s*\\{',
+    message: 'passing a context dict to an operator was removed in 4.0', hint: 'with bpy.context.temp_override(**overrides): bpy.ops....()' },
+  { id: 'object-select-attr', since: [2, 80], severity: 'error', pattern: '\\.select\\s*=\\s*(True|False)\\b',
+    message: 'Object.select is gone since 2.80', hint: 'obj.select_set(True)' },
+  { id: 'scene-objects-active', since: [2, 80], severity: 'error', pattern: '\\bscene\\.objects\\.active\\b',
+    message: 'scene.objects.active is gone since 2.80', hint: 'bpy.context.view_layer.objects.active = obj' },
+  { id: 'hemi-light', since: [2, 80], severity: 'error', pattern: 'type\\s*=\\s*["\']HEMI["\']',
+    message: 'HEMI lights were removed in 2.80', hint: 'use a SUN light' },
+  { id: 'rotation-data-path', severity: 'error', pattern: 'keyframe_insert\\(\\s*(data_path\\s*=\\s*)?["\']rotation["\']',
+    message: '"rotation" is not an animatable data path', hint: 'keyframe_insert(data_path="rotation_euler", ...)' },
+];
+
+const versionAtLeast = (v, min) => (v[0] > min[0]) || (v[0] === min[0] && (v[1] ?? 0) >= (min[1] ?? 0));
+
+// The drift rows that match this code on this Blender. With no version known,
+// every matching row is returned and the reader judges.
+function driftFor(code, version) {
+  const out = [];
+  for (const d of API_DRIFT) {
+    if (!new RegExp(d.pattern, 'm').test(code)) continue;
+    if (Array.isArray(version)) {
+      if (d.since && !versionAtLeast(version, d.since)) continue;
+      if (d.until && versionAtLeast(version, d.until)) continue;
+    }
+    out.push({ id: d.id, severity: d.severity, message: d.message, hint: d.hint,
+      ...(d.since ? { since: d.since.join('.') } : {}), ...(d.until ? { until: d.until.join('.') } : {}) });
+  }
+  return out;
+}
 
 // --- Locate the Blender binary (cross-platform, overridable) -----------------
 function platformCandidates() {
@@ -70,7 +163,10 @@ const blenderBin = (flags) => blenderBinInfo(flags).bin;
 const SENTINEL_A = '__BLENDER_CLI__';
 const SENTINEL_B = '__END__';
 
-function runBlender(body, { blend, save, params = {}, flags = {} } = {}) {
+// prepareBlender builds the wrapper script and the Blender argv; runBlender
+// executes it synchronously and parses the sentinel; runBlenderDetached starts
+// the same thing as a background job (see "Detached jobs" below).
+function prepareBlender(body, { blend, save, params = {}, flags = {} } = {}) {
   const bin = blenderBin(flags);
   let timeoutMs = 0;
   if (flags.timeout !== undefined) {
@@ -80,11 +176,15 @@ function runBlender(body, { blend, save, params = {}, flags = {} } = {}) {
     }
     timeoutMs = t * 1000;
   }
+  const addons = parseAddons(flags);
+  if (addons?.error) return { ok: false, error: addons.error };
+  if (blend && !existsSync(blend)) return { ok: false, error: `blend not found: ${blend}` };
   const dir = mkdtempSync(join(tmpdir(), 'blender-cli-'));
   const script = join(dir, 'run.py');
   const bodyFile = join(dir, 'body.py');
   writeFileSync(bodyFile, body);
   if (save) params.__save__ = save;
+  if (addons) params.__addons__ = addons.list;
   params.__body__ = bodyFile;
   const wrapper = `import bpy, json, sys, os, time, traceback, io, contextlib, base64, math
 def _clean(o):
@@ -107,6 +207,20 @@ def _finish(payload):
     if logs: payload["logs"] = logs[-2000:]
     emit(payload)
 try:
+    # --addons: Blender's own flag enabled these before the file loaded, but it
+    # only warns on stderr when a module is missing and carries on. Re-check
+    # here and fail loudly instead, naming what IS installed.
+    if PARAMS.get("__addons__"):
+        import addon_utils
+        _missing = []
+        for _m in PARAMS["__addons__"]:
+            if _m in bpy.context.preferences.addons: continue
+            try: _ok = addon_utils.enable(_m, default_set=False) is not None
+            except Exception: _ok = False
+            if not _ok: _missing.append(_m)
+        if _missing:
+            _avail = sorted(m.__name__ for m in addon_utils.modules(refresh=False))
+            raise RuntimeError("add-on(s) not available: " + ", ".join(_missing) + " (installed: " + ", ".join(_avail[:40]) + ("..." if len(_avail) > 40 else "") + "; see blender-cli addon list --all / addon install <file>)")
     with open(PARAMS["__body__"], encoding="utf-8") as _f:
         _code = compile(_f.read(), "<agent-bpy>", "exec")
     with contextlib.redirect_stdout(_buf):
@@ -116,7 +230,7 @@ try:
         result.setdefault("saved", PARAMS["__save__"])
     _finish({"ok": True, "result": result, "ms": int((time.time() - _t0) * 1000)})
 except Exception as e:
-    _p = {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+    _p = {"ok": False, "error": str(e), "trace": traceback.format_exc(), "bpy_version": list(bpy.app.version)}
     if result: _p["result"] = result
     _finish(_p)
     sys.exit(1)
@@ -124,24 +238,122 @@ except Exception as e:
   writeFileSync(script, wrapper);
 
   const args = ['--background'];
-  if (blend) { if (!existsSync(blend)) return { ok: false, error: `blend not found: ${blend}` }; args.push(blend); }
+  if (addons) args.push('--addons', addons.list.join(','));
+  if (blend) args.push(blend);
   args.push('--python', script, '--python-exit-code', '1');
+  return { ok: true, bin, args, dir, timeoutMs };
+}
 
+function parseSentinel(out) {
+  const m = (out || '').match(new RegExp(SENTINEL_A + '([A-Za-z0-9+/=]+)' + SENTINEL_B));
+  if (!m) return null;
+  try { return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')); }
+  catch { return { ok: false, error: 'bad JSON from Blender', raw: m[1].slice(0, 800) }; }
+}
+
+function runBlender(body, opts = {}) {
+  const p = prepareBlender(body, opts);
+  if (!p.ok) return { ok: false, error: p.error };
   // stdin is explicitly closed, never inherited. A Blender that inherits the
   // agent's stdin can block forever waiting on a pipe nobody writes to (the
   // classic Windows headless hang) — and --timeout would then be the only thing
   // ending the call. stdout/stderr stay piped: that's the result channel.
-  const r = spawnSync(bin, args, {
+  const r = spawnSync(p.bin, p.args, {
     encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
-    ...(timeoutMs > 0 ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
+    ...(p.timeoutMs > 0 ? { timeout: p.timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
-  if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, error: `Blender timed out after ${timeoutMs / 1000}s (killed)`, timed_out: true, bin };
-  if (r.error) return { ok: false, error: `cannot run Blender (${bin}): ${r.error.message}`, bin };
+  if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, error: `Blender timed out after ${p.timeoutMs / 1000}s (killed)`, timed_out: true, bin: p.bin };
+  if (r.error) return { ok: false, error: `cannot run Blender (${p.bin}): ${r.error.message}`, bin: p.bin };
   const out = r.stdout || '';
-  const m = out.match(new RegExp(SENTINEL_A + '([A-Za-z0-9+/=]+)' + SENTINEL_B));
-  if (!m) return { ok: false, error: 'no result from Blender (script may have crashed before emit)', exit: r.status, stderr_tail: (r.stderr || '').slice(-800), stdout_tail: out.slice(-800), bin };
-  try { return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')); } catch (e) { return { ok: false, error: 'bad JSON from Blender', raw: m[1].slice(0, 800) }; }
+  const parsed = parseSentinel(out);
+  if (!parsed) return { ok: false, error: 'no result from Blender (script may have crashed before emit)', exit: r.status, stderr_tail: (r.stderr || '').slice(-800), stdout_tail: out.slice(-800), bin: p.bin };
+  return parsed;
+}
+
+// --- Detached jobs: start Blender, return at once, poll later ---------------
+// A long animation render outlasts most agent tool-call limits (Claude Code
+// kills a shell call after 2 minutes by default; MCP clients give up around 5).
+// --detach spawns Blender unref'd with stdout/stderr going to a job directory,
+// so the CLI returns a job id immediately; `job status` reads progress from
+// Blender's own per-frame "Fra:" lines until the sentinel result appears.
+const JOBS_DIR = env.BLENDER_CLI_JOBS_DIR || process.env.BLENDER_CLI_JOBS_DIR || join(homedir(), '.cache', 'blender-cli', 'jobs');
+const jobDir = (id) => join(JOBS_DIR, id);
+function readJob(id) {
+  if (!id || /[\\/]/.test(id)) return null;
+  const f = join(jobDir(id), 'job.json');
+  if (!existsSync(f)) return null;
+  try { return JSON.parse(readFileSync(f, 'utf8')); } catch { return null; }
+}
+function writeJob(job) {
+  mkdirSync(jobDir(job.id), { recursive: true });
+  writeFileSync(join(jobDir(job.id), 'job.json'), JSON.stringify(job, null, 2));
+}
+function pidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+function runBlenderDetached(body, opts = {}, meta = {}) {
+  const p = prepareBlender(body, opts);
+  if (!p.ok) return { ok: false, error: p.error };
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  const id = `${stamp}-${Math.random().toString(36).slice(2, 6)}`;
+  mkdirSync(jobDir(id), { recursive: true });
+  const stdout = join(jobDir(id), 'stdout.log'), stderr = join(jobDir(id), 'stderr.log');
+  const fo = openSync(stdout, 'a'), fe = openSync(stderr, 'a');
+  let child;
+  try { child = spawn(p.bin, p.args, { detached: true, stdio: ['ignore', fo, fe] }); }
+  catch (e) { closeSync(fo); closeSync(fe); return { ok: false, error: `cannot start Blender (${p.bin}): ${e.message}` }; }
+  closeSync(fo); closeSync(fe);
+  child.unref();
+  const job = {
+    id, pid: child.pid, command: meta.command || 'exec', started: new Date().toISOString(),
+    bin: p.bin, blend: opts.blend || null, out: meta.out || null, frames: meta.frames || null,
+    status: 'running', stdout, stderr, ...(p.timeoutMs > 0 ? { timeout_at: Date.now() + p.timeoutMs } : {}),
+  };
+  writeJob(job);
+  return { ok: true, job: id, pid: child.pid, status: 'running', command: job.command, log: stdout,
+    hint: `blender-cli job status ${id}   (or: blender-cli job wait ${id} --timeout 600)` };
+}
+function jobStatus(id) {
+  const job = readJob(id);
+  if (!job) return { ok: false, error: `unknown job: ${id || '(none given)'}`, hint: 'blender-cli job list' };
+  const out = existsSync(job.stdout) ? readFileSync(job.stdout, 'utf8') : '';
+  const result = parseSentinel(out);
+  let status;
+  if (result) status = result.ok ? 'done' : 'failed';
+  else if (job.status === 'cancelled') status = 'cancelled';
+  else if (!pidAlive(job.pid)) status = job.status === 'timed_out' ? 'timed_out' : 'failed';
+  else if (job.timeout_at && Date.now() > job.timeout_at) { try { process.kill(job.pid, 'SIGKILL'); } catch { /* already gone */ } status = 'timed_out'; }
+  else status = 'running';
+  if (status !== job.status) { job.status = status; if (status !== 'running') job.finished = job.finished || new Date().toISOString(); writeJob(job); }
+  // Progress from Blender's own console: Cycles prints "Fra:12 Mem:..." per
+  // frame, every engine prints "Saved: '...'" per written image, and video
+  // encoding prints "Append frame 12". 5.x prefixes each line with a timestamp
+  // and a category ("00:02.326  render | Saved: ..."), so anchor after the bar too.
+  const fra = new Set(), appended = new Set();
+  for (const m of out.matchAll(/(?:^|\|\s*)Fra:(\d+)/gm)) fra.add(Number(m[1]));
+  for (const m of out.matchAll(/(?:^|\|\s*)Append frame (\d+)/gm)) appended.add(Number(m[1]));
+  const saved = (out.match(/(?:^|\|\s*)Saved: /gm) || []).length;
+  const done = Math.max(fra.size, appended.size, saved);
+  const total = Array.isArray(job.frames) ? job.frames[1] - job.frames[0] + 1 : null;
+  const progress = { frames_done: done, ...(total ? { frames_total: total, percent: Math.min(100, Math.round(100 * done / total)) } : {}) };
+  const lines = out.split('\n').filter(l => l.trim() && !l.includes(SENTINEL_A));
+  const end = job.finished ? Date.parse(job.finished) : Date.now();
+  const r = {
+    ok: !['failed', 'timed_out'].includes(status), job: id, status, command: job.command, pid: job.pid,
+    started: job.started, elapsed_s: Math.max(0, Math.round((end - Date.parse(job.started)) / 1000)),
+    progress, out: job.out, log: job.stdout,
+  };
+  if (result) {
+    r.result = result.result ?? null;
+    if (result.error) r.error = result.error;
+    if (result.logs) r.logs = result.logs;
+    if (result.ms) r.ms = result.ms;
+  } else if (status === 'running') r.last_line = lines[lines.length - 1] || null;
+  else if (status === 'failed') { r.error = 'Blender exited without a result'; r.stderr_tail = (existsSync(job.stderr) ? readFileSync(job.stderr, 'utf8') : '').slice(-800); r.stdout_tail = out.slice(-400); }
+  else if (status === 'timed_out') r.error = 'job exceeded --timeout and was killed';
+  return r;
 }
 
 // --- Asset backends: Poly Haven download + Meshy text-to-3D (Node >=18 fetch) --
@@ -400,7 +612,7 @@ const commands = {};
 // guess. Anything outside it reports `untested`, never `supported`: claiming
 // support for a major nobody exercised is how a tool tells a user everything is
 // fine right up until an operator it never called moved.
-const TESTED_VERSIONS = ['4.3', '5.2'];
+const TESTED_VERSIONS = ['5.1'];
 const MIN_VERSION = [3, 0];
 
 function supportVerdict(v) {
@@ -413,7 +625,7 @@ function supportVerdict(v) {
   return `untested (${drift}; tested on ${TESTED_VERSIONS.join(', ')}) — engines and import/export operators are resolved at runtime, so it may well work; please report breakage at https://github.com/renezander030/blender-cli/issues`;
 }
 commands.doctor = async (args, ctx) => {
-  const { flags } = fdn.parseArgs(args, ['blender', 'timeout']);
+  const { flags } = fdn.parseArgs(args, COMMON_FLAGS);
   const { bin, tried } = blenderBinInfo(flags);
   const ver = spawnSync(bin, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   if (ver.error) {
@@ -453,7 +665,18 @@ try:
             pass
 except Exception:
     pass
-result["gpu_devices"] = devs`, { flags });
+result["gpu_devices"] = devs
+# Which generation of the moving APIs this build has, probed live rather than
+# inferred from the version number (see API_DRIFT for the moves themselves).
+_P = lambda t: t.bl_rna.properties.keys()
+result["api"] = {
+    "actions": "slotted" if "layers" in _P(bpy.types.Action) else "legacy",
+    "compositor": "compositing_node_group" if "compositing_node_group" in _P(bpy.types.Scene) else "node_tree",
+    "eevee_engine_id": next((e for e in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE") if e in result["engines"]), "BLENDER_EEVEE"),
+    "obj_io": "wm.obj_import" if "obj_import" in imp else "import_scene.obj",
+    "stl_io": "wm.stl_import" if "stl_import" in imp else "import_mesh.stl",
+    "extensions": "package_install_files" in dir(bpy.ops.extensions)}
+result["addons_enabled"] = sorted(a.module for a in bpy.context.preferences.addons)`, { flags });
   const v = probe.ok ? probe.result.bpy_version : null;
   const verdict = supportVerdict(v);
   show({
@@ -471,8 +694,8 @@ result["gpu_devices"] = devs`, { flags });
 // (ok:false + exit 1 when the code does not compile — same contract as everywhere).
 // --safe refuses to run code that trips the AST gate (BLENDER_CLI_SAFE=1 makes
 // it the default; --unsafe overrides). --timeout <sec> kills a hung Blender.
-const EXEC_FLAGS = ['blend', 'save', 'blender', 'timeout'];
-const EXEC_USAGE = 'blender-cli exec "<bpy code>" [--blend f.blend] [--save out.blend] [--check] [--safe] [--timeout sec]';
+const EXEC_FLAGS = ['blend', 'save', ...COMMON_FLAGS];
+const EXEC_USAGE = 'blender-cli exec "<bpy code>" [--blend f.blend] [--save out.blend] [--check] [--safe] [--detach] [--addons a,b] [--timeout sec]';
 async function execBody(body, args, ctx) {
   const { flags } = fdn.parseArgs(args, EXEC_FLAGS);
   const safeMode = flags.unsafe ? false
@@ -507,9 +730,12 @@ RISKY = [
     (r"\\bsys\\.exit\\b", "sys.exit", "interpreter exit"),
 ]
 result["warnings"] = [{"call": name, "risk": why} for pat, name, why in RISKY if re.search(pat, code, re.M)]
+result["bpy_version"] = list(bpy.app.version)
 result["checked_only"] = True`;
     const r = runBlender(checker, { params: { __code__: body }, flags });
     if (r.ok && r.result && r.result.compiles === false) { r.ok = false; r.error = 'agent code does not compile'; }
+    // Version-aware API drift: only the rows that apply to THIS build are reported.
+    if (r.result) r.result.api_drift = driftFor(body, r.result.bpy_version || null);
     if (r.ok && safeMode) {
       const g = runBlender(SAFE_EXEC_BODY, { params: { __user__: writeUserFile(), __validate_only__: true }, flags });
       if (g.ok) r.result.safe_gate = g.result?.safe_gate || 'pass';
@@ -518,9 +744,22 @@ result["checked_only"] = True`;
     show(r, ctx); if (!r.ok) process.exit(1);
     return;
   }
+  if (flags.detach) {
+    const r = safeMode
+      ? runBlenderDetached(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __user__: writeUserFile() }, flags }, { command: 'exec' })
+      : runBlenderDetached(body, { blend: flags.blend, save: flags.save, flags }, { command: 'exec' });
+    show(r, ctx); if (!r.ok) process.exit(1);
+    return;
+  }
   const r = safeMode
     ? runBlender(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __user__: writeUserFile() }, flags })
     : runBlender(body, { blend: flags.blend, save: flags.save, flags });
+  // A failure on a known API move gets the matching hint appended, so the agent
+  // learns the replacement from the error instead of from a second search.
+  if (!r.ok && Array.isArray(r.bpy_version)) {
+    const drift = driftFor(body, r.bpy_version);
+    if (drift.length) r.api_drift = drift;
+  }
   show(r, ctx); if (!r.ok) process.exit(1);
 }
 commands.exec = async (args, ctx) => {
@@ -531,14 +770,14 @@ commands.exec = async (args, ctx) => {
 commands.run = async (args, ctx) => {
   const { positional } = fdn.parseArgs(args, EXEC_FLAGS);
   const file = positional[0];
-  if (!file || !existsSync(file)) { show({ ok: false, error: `script not found: ${file || '(none given)'}`, usage: 'blender-cli run <script.py> [--blend f.blend] [--save out.blend] [--check] [--timeout sec]' }, ctx); process.exit(1); }
+  if (!file || !existsSync(file)) { show({ ok: false, error: `script not found: ${file || '(none given)'}`, usage: 'blender-cli run <script.py> [--blend f.blend] [--save out.blend] [--check] [--safe] [--detach] [--timeout sec]' }, ctx); process.exit(1); }
   await execBody(readFileSync(file, 'utf8'), args, ctx);
 };
 
 // `blender-cli scene [--blend f.blend]` — dump scene state as JSON (the feedback loop).
 commands.scene = async (args, ctx) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'blender', 'timeout']);
-  const body = `sc = bpy.context.scene
+  const { flags } = fdn.parseArgs(args, ['blend', ...COMMON_FLAGS]);
+  const body = `${FCURVES_HELPER}sc = bpy.context.scene
 result["scene"] = sc.name
 result["engine"] = sc.render.engine
 result["resolution"] = [sc.render.resolution_x, sc.render.resolution_y]
@@ -549,7 +788,7 @@ result["objects"] = [
      "location": [round(v,4) for v in o.location],
      "rotation_euler": [round(v,4) for v in o.rotation_euler],
      "scale": [round(v,4) for v in o.scale],
-     "keyframes": (len(o.animation_data.action.fcurves) if o.animation_data and o.animation_data.action else 0)}
+     **_anim_summary(o)}
     for o in sc.objects]
 result["materials"] = [m.name for m in bpy.data.materials]
 result["cameras"] = [o.name for o in sc.objects if o.type == "CAMERA"]
@@ -587,18 +826,47 @@ if eng:
     except TypeError:
         raise RuntimeError("engine " + eng + " (" + _target + ") is not available in this Blender build (advertised: " + ", ".join(_ENGINES) + ")")
 dev = (PARAMS.get("device") or "").upper()
-if dev:
+_used = None
+if dev == "AUTO":
+    # Best available compute backend, in Cycles' own order of preference; CPU
+    # when nothing answers. Reported back so the agent knows what rendered.
+    if sc.render.engine == "CYCLES":
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+        for t in ("OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"):
+            try:
+                prefs.compute_device_type = t
+                found = [d for d in (prefs.get_devices_for_type(t) or []) if getattr(d, "type", "") == t]
+            except Exception:
+                found = []
+            if found:
+                for d in (prefs.get_devices_for_type(t) or []): d.use = True
+                sc.cycles.device = "GPU"
+                _used = {"requested": "auto", "type": t, "names": [d.name for d in found]}
+                break
+        if _used is None:
+            sc.cycles.device = "CPU"
+            _used = {"requested": "auto", "type": "CPU", "names": [], "note": "no GPU compute device available"}
+    else:
+        _used = {"requested": "auto", "type": "n/a", "note": "--device applies to Cycles only (engine is " + sc.render.engine + ")"}
+elif dev:
     if sc.render.engine != "CYCLES": raise RuntimeError("--device needs --engine cycles (got " + sc.render.engine + ")")
     if dev == "CPU":
         sc.cycles.device = "CPU"
+        _used = {"requested": "cpu", "type": "CPU", "names": []}
     else:
         prefs = bpy.context.preferences.addons["cycles"].preferences
         prefs.compute_device_type = dev
         devs = list(prefs.get_devices_for_type(dev) or [])
-        if not [d for d in devs if getattr(d, "type", "") == dev]:
-            raise RuntimeError("no " + dev + " device available (run doctor to list gpu_devices)")
+        found = [d for d in devs if getattr(d, "type", "") == dev]
+        if not found:
+            raise RuntimeError("no " + dev + " device available (run doctor to list gpu_devices, or use --device auto)")
         for d in devs: d.use = True
         sc.cycles.device = "GPU"
+        _used = {"requested": dev.lower(), "type": dev, "names": [d.name for d in found]}
+if PARAMS.get("threads") is not None:
+    _n = int(PARAMS["threads"])
+    if _n < 1: raise RuntimeError("--threads must be a positive integer")
+    sc.render.threads_mode = "FIXED"; sc.render.threads = _n
 def _eevee_samples_attr(sc):
     ee = getattr(sc, "eevee", None)
     if ee is None: return None, None
@@ -641,20 +909,25 @@ def _meta(result, sc):
     if sc.render.engine == "CYCLES": result["samples"] = sc.cycles.samples
     elif "EEVEE" in sc.render.engine:
         _ee, _a = _eevee_samples_attr(sc)
-        if _ee is not None: result["samples"] = getattr(_ee, _a)`;
+        if _ee is not None: result["samples"] = getattr(_ee, _a)
+    if _used is not None: result["device"] = _used
+    if sc.render.threads_mode == "FIXED": result["threads"] = sc.render.threads`;
 
 // `blender-cli render [--blend f] --out preview.png` — single-frame preview,
 // or `--animation` for the whole frame range as MP4 (via Blender's ffmpeg) or a
 // PNG sequence. Result JSON carries engine/resolution/samples/duration/bytes so
 // the agent can verify the render without a second round-trip.
 commands.render = async (args, ctx) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'frames', 'fps', 'samples', 'res', 'engine', 'device', 'denoise', 'blender', 'timeout', 'batch', 'ext']);
+  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'frames', 'fps', 'samples', 'res', 'engine', 'device', 'denoise', 'threads', 'batch', 'ext', ...COMMON_FLAGS]);
   const animation = !!flags.animation;
   const out = resolve(flags.out || join(process.cwd(), animation ? 'preview.mp4' : 'preview.png'));
+  if (flags.threads !== undefined && !(Number.isInteger(Number(flags.threads)) && Number(flags.threads) > 0)) {
+    show({ ok: false, error: `invalid --threads: ${flags.threads} (a positive integer)` }, ctx); process.exit(1);
+  }
   const params = {
     out, frame: flags.frame ?? null, frames: flags.frames || null, fps: flags.fps ?? null,
     res: flags.res || null, engine: flags.engine || null, device: flags.device || null,
-    samples: flags.samples ?? null, denoise: flags.denoise ?? null,
+    samples: flags.samples ?? null, denoise: flags.denoise ?? null, threads: flags.threads ?? null,
   };
   const still = `${RENDER_SETUP}
 if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
@@ -721,6 +994,17 @@ result["fps"] = sc.render.fps
 result["duration_ms"] = int((time.time() - _t) * 1000)
 _meta(result, sc)`;
   const body = animation ? anim : still;
+  if (flags.detach) {
+    if (flags.batch) { show({ ok: false, error: '--detach and --batch cannot be combined; detach one render at a time' }, ctx); process.exit(1); }
+    // Frame range, when given, lets `job status` report percent done.
+    let frames = null;
+    const fm = String(flags.frames || '').match(/^\s*(-?\d+)\s*(?:\.\.|:)\s*(-?\d+)\s*$/);
+    if (fm) frames = [Number(fm[1]), Number(fm[2])];
+    else if (/^\s*-?\d+\s*$/.test(String(flags.frames || ''))) frames = [Number(flags.frames), Number(flags.frames)];
+    const r = runBlenderDetached(body, { blend: flags.blend, params, flags }, { command: animation ? 'render --animation' : 'render', out, frames });
+    show(r, ctx); if (!r.ok) process.exit(1);
+    return;
+  }
   if (flags.batch) {
     const files = globFiles(String(flags.batch));
     if (!files.length) {
@@ -744,7 +1028,7 @@ _meta(result, sc)`;
 // Haven asset by id (model -> imported, hdri -> world environment, texture ->
 // wired PBR material). Reports what arrived so the agent can verify.
 commands.import = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'blender', 'timeout', 'type', 'res', 'batch']);
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'type', 'res', 'batch', ...COMMON_FLAGS]);
   const src = positional[0];
   if (flags.batch) {
     const files = globFiles(String(flags.batch));
@@ -793,7 +1077,7 @@ commands.import = async (args, ctx) => {
 // one polling/download/import path; only the endpoint and payload differ.
 const IMAGE_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
 commands.generate = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['out', 'backend', 'blend', 'save', 'blender', 'timeout', 'wait', 'image']);
+  const { flags, positional } = fdn.parseArgs(args, ['out', 'backend', 'blend', 'save', 'wait', 'image', ...COMMON_FLAGS]);
   const prompt = positional.join(' ').trim();
   const usage = 'blender-cli generate "<prompt>" | generate --image ref.png [--out asset.glb] [--import] [--blend f] [--save f] [--wait sec]';
   const imageArg = typeof flags.image === 'string' ? flags.image : null;
@@ -877,8 +1161,9 @@ commands.generate = async (args, ctx) => {
 // dimensions the target format actually carries, so STL is never accused of
 // losing materials it was never able to hold. --no-verify skips the readback,
 // --strict turns a degraded result into a non-zero exit.
-const EXPORT_BODY = `p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
+const EXPORT_BODY = `${FCURVES_HELPER}p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
 sel = bool(PARAMS.get("selected"))
+anim = PARAMS.get("animations") is not False
 os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
 wm = dir(bpy.ops.wm)
 
@@ -891,12 +1176,17 @@ def _census(objs):
     def _nsk(o):
         sk = getattr(o.data, "shape_keys", None)
         return max(0, len(sk.key_blocks) - 1) if sk else 0
+    # An object counts as animated with two or more keys: a single key holds no
+    # motion and several exporters legitimately skip it.
+    def _nkeys(o): return sum(len(fc.keyframe_points) for fc in _fcurves(o))
+    animated = [o for o in objs if _nkeys(o) >= 2]
     return {"objects": len(objs), "meshes": len(meshes),
         "verts": sum(len(o.data.vertices) for o in meshes),
         "materials": len(mats),
         "uv_layers": sum(len(o.data.uv_layers) for o in meshes),
         "color_attrs": sum(len(getattr(o.data, "color_attributes", []) or []) for o in meshes),
-        "shape_keys": sum(_nsk(o) for o in meshes)}
+        "shape_keys": sum(_nsk(o) for o in meshes),
+        "animated": len(animated), "keyframes": sum(_nkeys(o) for o in animated)}
 
 # What each container can actually represent. Comparing outside this set would
 # manufacture "losses" the format was never capable of carrying.
@@ -910,11 +1200,16 @@ def _census(objs):
 # into one mesh by definition, so comparing mesh COUNT there would report a loss
 # on every multi-object export forever. Their vertex total still tells the truth.
 # (Each row below was measured against real round-trips, not assumed.)
-_ALL = ["meshes", "verts", "materials", "uv_layers", "color_attrs", "shape_keys"]
+# Animation is compared as "animated objects", never as raw keyframe counts:
+# importers resample (glTF bakes one key per frame), so counts only go UP on a
+# healthy round-trip while a vanished animation still shows as 1 -> 0. USD is
+# written with animation, but Blender's USD importer does not read it back as
+# keyframes, so USD is not judged on it (measured, not assumed).
+_ALL = ["meshes", "verts", "materials", "uv_layers", "color_attrs", "shape_keys", "animated"]
 _GEO_MAT = ["meshes", "verts", "materials", "uv_layers"]
 CARRIES = {"glb": _ALL, "gltf": _ALL,
     "obj": _GEO_MAT,
-    "fbx": ["meshes", "verts", "materials", "uv_layers", "shape_keys"],
+    "fbx": ["meshes", "verts", "materials", "uv_layers", "shape_keys", "animated"],
     "stl": ["verts"],
     "ply": ["verts", "color_attrs"],
     "usd": _GEO_MAT, "usda": _GEO_MAT, "usdc": _GEO_MAT, "usdz": _GEO_MAT}
@@ -922,15 +1217,16 @@ CARRIES = {"glb": _ALL, "gltf": _ALL,
 _scene_objs = [o for o in bpy.context.scene.objects if not sel or o.select_get()]
 before = _census(_scene_objs)
 
-if ext in ("glb", "gltf"): bpy.ops.export_scene.gltf(filepath=p, export_format=("GLB" if ext == "glb" else "GLTF_SEPARATE"), use_selection=sel)
+if ext in ("glb", "gltf"): bpy.ops.export_scene.gltf(filepath=p, export_format=("GLB" if ext == "glb" else "GLTF_SEPARATE"), use_selection=sel, export_animations=anim)
 elif ext == "obj": (bpy.ops.wm.obj_export(filepath=p, export_selected_objects=sel) if "obj_export" in wm else bpy.ops.export_scene.obj(filepath=p, use_selection=sel))
-elif ext == "fbx": bpy.ops.export_scene.fbx(filepath=p, use_selection=sel)
+elif ext == "fbx": bpy.ops.export_scene.fbx(filepath=p, use_selection=sel, bake_anim=anim)
 elif ext == "stl": (bpy.ops.wm.stl_export(filepath=p, export_selected_objects=sel) if "stl_export" in wm else bpy.ops.export_mesh.stl(filepath=p, use_selection=sel))
 elif ext == "ply": (bpy.ops.wm.ply_export(filepath=p, export_selected_objects=sel) if "ply_export" in wm else bpy.ops.export_mesh.ply(filepath=p, use_selection=sel))
-elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_export(filepath=p, selected_objects_only=sel)
+elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_export(filepath=p, selected_objects_only=sel, export_animation=anim)
 else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz)")
 
-result["exported"] = {"file": p, "format": ext, "bytes": os.path.getsize(p), "objects": len(_scene_objs)}
+result["exported"] = {"file": p, "format": ext, "bytes": os.path.getsize(p), "objects": len(_scene_objs),
+    "animation": {"objects": before["animated"], "keyframes": before["keyframes"], "exported": anim}}
 
 if PARAMS.get("verify"):
     fid = {"checked": False}
@@ -946,7 +1242,7 @@ if PARAMS.get("verify"):
         elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_import(filepath=p)
         else: raise RuntimeError("no importer for ." + ext)
         after = _census(list(bpy.context.scene.objects))
-        fields = CARRIES.get(ext, ["meshes", "verts"])
+        fields = [k for k in CARRIES.get(ext, ["meshes", "verts"]) if anim or k != "animated"]
         # More is fine (glTF splits verts at UV/normal seams); less is a loss.
         lost = [{"field": k, "scene": before[k], "file": after[k]} for k in fields if after[k] < before[k]]
         fid = {"checked": True, "ok": not lost, "compared": fields,
@@ -956,9 +1252,12 @@ if PARAMS.get("verify"):
     result["exported"]["fidelity"] = fid`;
 
 commands.export = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'blender', 'timeout', 'batch', 'format']);
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'batch', 'format', 'animations', ...COMMON_FLAGS]);
   const outArg = positional[0];
   const verify = !flags['no-verify'];
+  const animFlag = flags.animations === undefined ? 'on' : String(flags.animations).toLowerCase();
+  if (!['on', 'off'].includes(animFlag)) { show({ ok: false, error: `invalid --animations: ${flags.animations} (use on|off)` }, ctx); process.exit(1); }
+  const animations = animFlag === 'on';
   if (flags.batch) {
     const files = globFiles(String(flags.batch));
     if (!files.length) {
@@ -973,7 +1272,7 @@ commands.export = async (args, ctx) => {
     }
     const outDir = resolve(outArg || process.cwd());
     const agg = await batchRun(files, (f) =>
-      runBlender(EXPORT_BODY, { blend: f, params: { out: join(outDir, `${stemOf(f)}.${fmt}`), selected: !!flags.selected, verify }, flags }));
+      runBlender(EXPORT_BODY, { blend: f, params: { out: join(outDir, `${stemOf(f)}.${fmt}`), selected: !!flags.selected, verify, animations }, flags }));
     if (agg.ok && flags.strict) {
       const bad = agg.result.items.filter(i => i.result?.exported?.fidelity?.checked && !i.result.exported.fidelity.ok);
       if (bad.length) { agg.ok = false; agg.error = `export degraded in ${bad.length} of ${agg.result.total} file(s)`; }
@@ -985,7 +1284,7 @@ commands.export = async (args, ctx) => {
     show({ ok: false, error: 'missing output path', usage: 'blender-cli export <out.glb|obj|fbx|stl|ply|usd> [--blend f] [--selected] [--no-verify] [--strict]' }, ctx);
     process.exit(1);
   }
-  const r = runBlender(EXPORT_BODY, { blend: flags.blend, params: { out: resolve(outArg), selected: !!flags.selected, verify }, flags });
+  const r = runBlender(EXPORT_BODY, { blend: flags.blend, params: { out: resolve(outArg), selected: !!flags.selected, verify, animations }, flags });
   const fid = r?.result?.exported?.fidelity;
   if (r.ok && flags.strict && fid?.checked && !fid.ok) {
     r.ok = false;
@@ -1042,6 +1341,65 @@ for o in objs:
     elif o.type == "MESH" and max(abs(v) for v in s) - min(abs(v) for v in s) > 1e-4:
         add("warn", "non_uniform_scale", "unapplied non-uniform scale distorts normals, modifiers and physics; apply it before export", o.name, scale=[round(v, 6) for v in s])
 
+# Mesh health: what the transform checks cannot see. Loose geometry and
+# zero-area faces vanish in exporters, non-manifold edges break booleans and
+# printing, inconsistent winding breaks shading and culling, and a game-engine
+# collider (UCX_/UBX_/USP_/UCP_ prefix) that is not convex imports without a
+# word and collides wrongly in the engine. --no-mesh skips this pass.
+import bmesh
+mesh_stats = {}
+MESH_LIMIT = 500000
+COLLIDER_PREFIXES = ("UCX_", "UBX_", "USP_", "UCP_")
+if not PARAMS.get("no_mesh"):
+    for o in meshes:
+        me = o.data
+        if len(me.vertices) > MESH_LIMIT:
+            add("info", "mesh_check_skipped", "%d vertices (> %d); mesh checks skipped" % (len(me.vertices), MESH_LIMIT), o.name)
+            continue
+        bm = bmesh.new(); bm.from_mesh(me)
+        loose_v = sum(1 for v in bm.verts if not v.link_edges)
+        loose_e = sum(1 for e in bm.edges if not e.link_faces)
+        boundary = sum(1 for e in bm.edges if e.is_boundary)
+        nonman = sum(1 for e in bm.edges if e.link_faces and not e.is_manifold and not e.is_boundary)
+        zero_area = sum(1 for f in bm.faces if f.calc_area() < 1e-9)
+        manifold = [e for e in bm.edges if e.is_manifold]
+        inconsistent = sum(1 for e in manifold if not e.is_contiguous)
+        inverted = False
+        if manifold and boundary == 0 and inconsistent == 0:
+            neg = sum(1 for e in manifold if e.calc_face_angle_signed(0.0) < -1e-5)
+            pos = sum(1 for e in manifold if e.calc_face_angle_signed(0.0) > 1e-5)
+            inverted = neg > 0 and pos == 0
+        ngons = sum(1 for f in bm.faces if len(f.verts) > 4)
+        st = {"verts": len(bm.verts), "edges": len(bm.edges), "faces": len(bm.faces), "boundary_edges": boundary,
+            "non_manifold_edges": nonman, "loose_verts": loose_v, "loose_edges": loose_e, "zero_area_faces": zero_area,
+            "inconsistent_normals": inconsistent, "inverted_normals": inverted, "ngons": ngons,
+            "modifiers": [m.type for m in o.modifiers]}
+        if loose_v or loose_e: add("warn", "loose_geometry", "%d loose vertices, %d loose edges; most exporters drop them" % (loose_v, loose_e), o.name)
+        if nonman: add("warn", "non_manifold", "%d non-manifold edges (3+ faces or wire); booleans, printing and some exporters misbehave" % nonman, o.name)
+        if zero_area: add("warn", "zero_area_faces", "%d zero-area faces" % zero_area, o.name)
+        if inconsistent: add("warn", "inconsistent_normals", "%d edges where adjacent faces wind in opposite directions; shading and backface culling break" % inconsistent, o.name)
+        if inverted: add("warn", "inverted_normals", "every face normal points inward on this closed mesh", o.name)
+        if boundary and len(bm.faces): add("info", "open_mesh", "%d boundary edges; mesh is not watertight" % boundary, o.name)
+        if o.name.upper().startswith(COLLIDER_PREFIXES):
+            bm2 = bm.copy(); bmesh.ops.triangulate(bm2, faces=bm2.faces[:])
+            ext_ = max((max(v.co[k] for v in bm2.verts) - min(v.co[k] for v in bm2.verts)) for k in range(3)) if bm2.verts else 1.0
+            eps = 1e-5 * max(ext_, 1e-6)
+            concave = False
+            for f in bm2.faces:
+                c = f.calc_center_median(); nrm = f.normal
+                if any((v.co - c).dot(nrm) > eps for v in bm2.verts): concave = True; break
+            bm2.free()
+            st["convex"] = not concave
+            if concave: add("error", "concave_collider", "collision mesh is not convex; UCX_-style colliders must be convex hulls (engines import them silently and collide wrongly)", o.name)
+        bm.free()
+        types = st["modifiers"]
+        if "MULTIRES" in types and types[-1] != "MULTIRES":
+            add("error", "multires_not_last", "Multires must be the last modifier to sculpt and bake correctly; stack is " + " > ".join(types), o.name)
+        if "MIRROR" in types and "SUBSURF" in types and types.index("MIRROR") > types.index("SUBSURF"):
+            add("warn", "mirror_after_subsurf", "Mirror after Subdivision leaves a visible seam; put Mirror first", o.name)
+        if types: add("info", "modifiers_pending", "%d unapplied modifier(s): %s (exporters apply them; verify counts the base mesh)" % (len(types), ", ".join(types)), o.name)
+        mesh_stats[o.name] = st
+
 # Overlap: real interpenetration on every axis, not a shared face or edge.
 for i in range(len(meshes)):
     for j in range(i + 1, len(meshes)):
@@ -1076,10 +1434,10 @@ counts = {"error": 0, "warn": 0, "info": 0}
 for f in F: counts[f["severity"]] += 1
 result["verified"] = {"scene": sc.name, "objects": len(objs), "meshes": len(meshes),
     "tolerance": tol, "errors": counts["error"], "warnings": counts["warn"],
-    "infos": counts["info"], "findings": F}`;
+    "infos": counts["info"], "findings": F, "mesh": mesh_stats}`;
 
 commands.verify = async (args, ctx) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'blender', 'timeout', 'tolerance', 'fail-on']);
+  const { flags } = fdn.parseArgs(args, ['blend', 'tolerance', 'fail-on', ...COMMON_FLAGS]);
   const failOn = flags['fail-on'] || 'error';
   if (!['error', 'warn', 'none'].includes(failOn)) {
     show({ ok: false, error: `invalid --fail-on: ${failOn} (use error|warn|none)` }, ctx); process.exit(1);
@@ -1087,7 +1445,7 @@ commands.verify = async (args, ctx) => {
   if (flags.tolerance !== undefined && !(Number(flags.tolerance) >= 0)) {
     show({ ok: false, error: `invalid --tolerance: ${flags.tolerance} (a non-negative number, e.g. 0.001)` }, ctx); process.exit(1);
   }
-  const r = runBlender(VERIFY_BODY, { blend: flags.blend, params: { tolerance: flags.tolerance ?? null }, flags });
+  const r = runBlender(VERIFY_BODY, { blend: flags.blend, params: { tolerance: flags.tolerance ?? null, no_mesh: !!flags['no-mesh'] }, flags });
   const v = r?.result?.verified;
   if (r.ok && v && failOn !== 'none') {
     const bad = failOn === 'warn' ? v.errors + v.warnings : v.errors;
@@ -1098,7 +1456,7 @@ commands.verify = async (args, ctx) => {
 
 // `blender-cli new <name> [--save path.blend]` — scaffold a clean project with camera + light.
 commands.new = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['save', 'blender', 'timeout']);
+  const { flags, positional } = fdn.parseArgs(args, ['save', ...COMMON_FLAGS]);
   const name = positional.join(' ') || 'untitled';
   const save = flags.save || join(process.cwd(), `${name.replace(/\s+/g, '_')}.blend`);
   const body = `bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -1118,45 +1476,705 @@ result["scaffolded"] = {"scene": sc.name, "camera": cam.name, "light": light.nam
   show(r, ctx); if (!r.ok) process.exit(1);
 };
 
+// `blender-cli snapshot` — look at what you built without spending a real render.
+// Workbench renders orthographic front/right/top views plus a fitted 3/4
+// perspective, tiles them into one PNG, and reports per-view coverage (fraction
+// of pixels the geometry actually occupies, via the alpha channel), the
+// occupied bounding box and mean luminance, so an agent can tell "framed and
+// visible" from "blank" or "off to one side" without an image model in the loop.
+const SNAPSHOT_BODY = `import math as _m
+from mathutils import Vector, Euler
+import numpy as np
+sc = bpy.context.scene
+if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
+VISIBLE = ("MESH", "CURVE", "FONT", "SURFACE", "META")
+targets = [o for o in sc.objects if o.type in VISIBLE and o.visible_get()]
+if not targets: raise RuntimeError("nothing to snapshot: the scene has no visible mesh/curve/text objects")
+lo = [1e30, 1e30, 1e30]; hi = [-1e30, -1e30, -1e30]
+for o in targets:
+    for c in o.bound_box:
+        w = o.matrix_world @ Vector(c)
+        for k in range(3):
+            lo[k] = min(lo[k], w[k]); hi[k] = max(hi[k], w[k])
+lo = Vector(lo); hi = Vector(hi)
+center = (lo + hi) / 2; size = hi - lo
+extent = max(size.x, size.y, size.z, 1e-6)
+W, H = [int(x) for x in str(PARAMS.get("res") or "512x384").lower().split("x")]
+aspect = W / H
+sc.render.engine = "BLENDER_WORKBENCH"
+sc.render.resolution_x, sc.render.resolution_y = W, H
+sc.render.resolution_percentage = 100
+sc.render.film_transparent = True
+sc.render.image_settings.file_format = "PNG"
+sc.render.image_settings.color_mode = "RGBA"
+sc.render.use_file_extension = False
+sh = sc.display.shading
+mode = str(PARAMS.get("shading") or "random").lower()
+if mode not in ("random", "material", "solid"): raise RuntimeError("--shading must be random|material|solid")
+sh.light = "STUDIO"; sh.show_object_outline = True
+sh.type = "SOLID"
+sh.color_type = {"random": "RANDOM", "material": "MATERIAL", "solid": "SINGLE"}[mode]
+cam_data = bpy.data.cameras.new("__bcli_snapshot"); cam = bpy.data.objects.new("__bcli_snapshot", cam_data)
+sc.collection.objects.link(cam); sc.camera = cam
+HALF = _m.pi / 2
+VIEWS = {
+    "front":  (Vector((0, -1, 0)), Euler((HALF, 0, 0)), "ortho"),
+    "back":   (Vector((0, 1, 0)),  Euler((HALF, 0, _m.pi)), "ortho"),
+    "right":  (Vector((1, 0, 0)),  Euler((HALF, 0, HALF)), "ortho"),
+    "left":   (Vector((-1, 0, 0)), Euler((HALF, 0, -HALF)), "ortho"),
+    "top":    (Vector((0, 0, 1)),  Euler((0, 0, 0)), "ortho"),
+    "bottom": (Vector((0, 0, -1)), Euler((_m.pi, 0, 0)), "ortho"),
+    "persp":  (Vector((1, -1, 0.8)).normalized(), None, "persp"),
+}
+names = [v.strip().lower() for v in str(PARAMS.get("views") or "front,right,top,persp").split(",") if v.strip()]
+bad = [n for n in names if n not in VIEWS]
+if bad: raise RuntimeError("unknown view(s): " + ", ".join(bad) + " (use " + ", ".join(VIEWS) + ")")
+if not names: raise RuntimeError("no views given")
+tiles = []; views = []
+for name in names:
+    direction, rot, kind = VIEWS[name]
+    if kind == "persp":
+        cam_data.type = "PERSP"; cam_data.lens = 50
+        radius = max(size.length / 2, 1e-6)
+        fov = 2 * _m.atan(cam_data.sensor_width / (2 * cam_data.lens))
+        vfov = 2 * _m.atan(_m.tan(fov / 2) / aspect) if aspect > 1 else fov
+        dist = radius / _m.sin(min(fov, vfov) / 2) * 1.1
+        cam.location = center + direction * dist
+        cam.rotation_euler = (center - cam.location).to_track_quat("-Z", "Y").to_euler()
+    else:
+        cam_data.type = "ORTHO"
+        dist = extent * 3.0
+        cam.location = center + direction * dist
+        cam.rotation_euler = rot
+        if name in ("front", "back"): ex, ey = size.x, size.z
+        elif name in ("right", "left"): ex, ey = size.y, size.z
+        else: ex, ey = size.x, size.y
+        cam_data.ortho_scale = max(ex, ey * aspect, 1e-6) * 1.15
+    cam_data.clip_start = 0.01; cam_data.clip_end = max(dist * 4, 100.0)
+    fpath = os.path.join(PARAMS["tmp"], "view_" + name + ".png")
+    sc.render.filepath = fpath
+    bpy.ops.render.render(write_still=True)
+    img = bpy.data.images.load(fpath)
+    px = np.array(img.pixels[:], dtype=np.float32).reshape(H, W, 4)
+    bpy.data.images.remove(img)
+    alpha = px[:, :, 3] > 0.5
+    cov = float(alpha.mean())
+    if alpha.any():
+        ys, xs = np.nonzero(alpha)
+        bbox = [round(float(xs.min()) / W, 3), round(float(ys.min()) / H, 3), round(float(xs.max() + 1) / W, 3), round(float(ys.max() + 1) / H, 3)]
+        lum = float((0.2126 * px[:, :, 0] + 0.7152 * px[:, :, 1] + 0.0722 * px[:, :, 2])[alpha].mean())
+    else:
+        bbox = None; lum = 0.0
+    views.append({"view": name, "projection": kind, "coverage": round(cov, 4), "bbox": bbox, "luminance": round(lum, 4), "blank": cov < 0.002})
+    tiles.append(px)
+n = len(tiles); cols = 2 if n > 1 else 1; rows = (n + cols - 1) // cols
+bg = float(PARAMS.get("bg")) if PARAMS.get("bg") is not None else 0.18
+sheet = np.full((rows * H, cols * W, 4), (bg, bg, bg, 1.0), dtype=np.float32)
+for i, t in enumerate(tiles):
+    r_, c_ = divmod(i, cols)
+    a = t[:, :, 3:4]
+    y0 = (rows - 1 - r_) * H
+    sheet[y0:y0 + H, c_ * W:(c_ + 1) * W, :3] = t[:, :, :3] * a + bg * (1 - a)
+img = bpy.data.images.new("__bcli_sheet", cols * W, rows * H, alpha=True)
+img.pixels.foreach_set(sheet.ravel())
+out = PARAMS["out"]
+os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+img.filepath_raw = out; img.file_format = "PNG"; img.save()
+result["snapshot"] = {"sheet": out, "bytes": os.path.getsize(out), "tile": [W, H], "grid": [cols, rows],
+    "layout": [names[r_ * cols:(r_ + 1) * cols] for r_ in range(rows)], "views": views,
+    "bounds": {"min": [round(v, 4) for v in lo], "max": [round(v, 4) for v in hi], "size": [round(v, 4) for v in size], "center": [round(v, 4) for v in center]},
+    "objects": len(targets), "shading": mode, "frame": sc.frame_current}
+blank = [v["view"] for v in views if v["blank"]]
+if blank: result["snapshot"]["warnings"] = ["blank view(s): " + ", ".join(blank) + " (nothing visible from there)"]`;
+
+commands.snapshot = async (args, ctx) => {
+  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'views', 'res', 'shading', 'frame', 'bg', ...COMMON_FLAGS]);
+  const out = resolve(flags.out || join(process.cwd(), 'snapshot.png'));
+  if (flags.res !== undefined && !/^\d+x\d+$/i.test(String(flags.res))) { show({ ok: false, error: `invalid --res: ${flags.res} (WxH, e.g. 512x384)` }, ctx); process.exit(1); }
+  const tmp = mkdtempSync(join(tmpdir(), 'blender-cli-snap-'));
+  const r = runBlender(SNAPSHOT_BODY, { blend: flags.blend, params: {
+    out, tmp, views: flags.views || null, res: flags.res || null, shading: flags.shading || null,
+    frame: flags.frame ?? null, bg: flags.bg ?? null,
+  }, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// --- Parametric verbs: add / keyframe / material ----------------------------
+// The agent can always write bpy, but the same twenty lines of boilerplate get
+// re-derived on every call and the active_object context trips it up (one
+// operation between creation and finalize silently retargets the wrong mesh).
+// These verbs address objects by NAME, run every op in one Blender launch, and
+// report the resulting state, so a scene can be built without touching bpy.
+const ADD_BODY = `import math as _m
+from mathutils import Vector
+sc = bpy.context.scene
+def _vec(v, n=3):
+    if v is None: return None
+    if isinstance(v, str): v = [float(x) for x in v.split(",")]
+    if isinstance(v, (int, float)): v = [float(v)]
+    v = [float(x) for x in v]
+    if len(v) == 1 and n == 3: v = v * 3
+    if len(v) != n: raise RuntimeError("expected %d comma-separated numbers, got %r" % (n, v))
+    return v
+def _link(o):
+    sc.collection.objects.link(o); return o
+KINDS = ("cube", "sphere", "icosphere", "plane", "cylinder", "cone", "torus", "monkey", "camera", "light", "empty", "text")
+created = []
+for op in PARAMS["ops"]:
+    what = str(op.get("what") or "").lower()
+    if what not in KINDS: raise RuntimeError("unknown object kind: %r (use %s)" % (what, "|".join(KINDS)))
+    name = op.get("name")
+    at = _vec(op.get("at")) or [0.0, 0.0, 0.0]
+    size_given = op.get("size")
+    size = float(size_given) if size_given is not None else 2.0
+    before = set(x.name for x in bpy.data.objects)
+    o = None
+    if what == "cube": bpy.ops.mesh.primitive_cube_add(size=size, location=at)
+    elif what == "sphere": bpy.ops.mesh.primitive_uv_sphere_add(radius=size / 2, location=at)
+    elif what == "icosphere": bpy.ops.mesh.primitive_ico_sphere_add(radius=size / 2, location=at)
+    elif what == "plane": bpy.ops.mesh.primitive_plane_add(size=size, location=at)
+    elif what == "cylinder": bpy.ops.mesh.primitive_cylinder_add(radius=size / 2, depth=size, location=at)
+    elif what == "cone": bpy.ops.mesh.primitive_cone_add(radius1=size / 2, depth=size, location=at)
+    elif what == "torus": bpy.ops.mesh.primitive_torus_add(major_radius=size / 2, minor_radius=size / 8, location=at)
+    elif what == "monkey": bpy.ops.mesh.primitive_monkey_add(size=size, location=at)
+    elif what == "camera":
+        o = _link(bpy.data.objects.new(name or "Camera", bpy.data.cameras.new(name or "Camera")))
+        if op.get("lens") is not None: o.data.lens = float(op["lens"])
+        if sc.camera is None or op.get("active"): sc.camera = o
+    elif what == "light":
+        t = str(op.get("type") or "point").upper()
+        if t not in ("POINT", "SUN", "SPOT", "AREA"): raise RuntimeError("light --type must be point|sun|spot|area")
+        ld = bpy.data.lights.new(name or t.title(), type=t)
+        if op.get("energy") is not None: ld.energy = float(op["energy"])
+        col = _vec(op.get("color"))
+        if col: ld.color = col
+        o = _link(bpy.data.objects.new(name or t.title(), ld))
+    elif what == "empty":
+        o = _link(bpy.data.objects.new(name or "Empty", None))
+    elif what == "text":
+        cu = bpy.data.curves.new(name or "Text", type="FONT")
+        cu.body = str(op.get("text") if op.get("text") is not None else "Text")
+        cu.size = float(size_given) if size_given is not None else 1.0
+        o = _link(bpy.data.objects.new(name or "Text", cu))
+    if o is None:
+        new = [x for x in bpy.data.objects if x.name not in before]
+        o = new[0] if new else bpy.context.view_layer.objects.active
+    o.location = at
+    if name: o.name = name
+    rot = _vec(op.get("rot"))
+    if rot: o.rotation_euler = [_m.radians(v) for v in rot]
+    scl = _vec(op.get("scale"))
+    if scl: o.scale = scl
+    la = _vec(op.get("look_at"))
+    if la: o.rotation_euler = (Vector(la) - Vector(o.location)).to_track_quat("-Z", "Y").to_euler()
+    bpy.context.view_layer.update()
+    created.append({"name": o.name, "type": o.type, "kind": what, "location": [round(v, 4) for v in o.location],
+        "rotation_deg": [round(_m.degrees(v), 2) for v in o.rotation_euler], "scale": [round(v, 4) for v in o.scale],
+        "dimensions": [round(v, 4) for v in o.dimensions], "renamed": bool(name and o.name != name)})
+result["added"] = created
+result["objects"] = len(sc.objects)`;
+
+const KEYFRAME_BODY = `${FCURVES_HELPER}import math as _m
+sc = bpy.context.scene
+ALIAS = {"location": "location", "loc": "location", "rotation": "rotation_euler", "rot": "rotation_euler",
+    "rotation_euler": "rotation_euler", "scale": "scale"}
+extend = PARAMS.get("extend", True)
+keyed = []; touched = []
+for op in PARAMS["ops"]:
+    oname = op.get("object")
+    o = bpy.data.objects.get(str(oname)) if oname else None
+    if o is None:
+        raise RuntimeError("no object named %r (objects: %s)" % (oname, ", ".join(sorted(x.name for x in bpy.data.objects)[:40]) or "none"))
+    prop = str(op.get("prop") or "location")
+    path = ALIAS.get(prop, prop)
+    frame = int(op["frame"])
+    # Dotted paths (data.energy, modifiers["Wave"].height) resolve to their
+    # owner; the key is inserted relative to that owner.
+    head, _, attr = path.rpartition(".")
+    owner = o.path_resolve(head) if head else o
+    val = op.get("value")
+    if val is not None:
+        if isinstance(val, str): val = [float(x) for x in val.split(",")]
+        if isinstance(val, (int, float)): val = [float(val)]
+        val = [float(v) for v in val]
+        if path == "rotation_euler": val = [_m.radians(v) for v in val]
+        try:
+            cur = getattr(owner, attr)
+        except AttributeError:
+            raise RuntimeError("object %s has no property %r" % (o.name, path))
+        if hasattr(cur, "__len__"):
+            if len(val) == 1 and len(cur) > 1: val = val * len(cur)
+            if len(val) != len(cur): raise RuntimeError("%s expects %d values, got %d" % (path, len(cur), len(val)))
+            setattr(owner, attr, val)
+        else:
+            setattr(owner, attr, val[0])
+    if not owner.keyframe_insert(data_path=attr, frame=frame):
+        raise RuntimeError("keyframe_insert failed for %s.%s at frame %d" % (o.name, path, frame))
+    interp = str(op.get("interp") or PARAMS.get("interp") or "").upper()
+    if interp:
+        if interp not in ("LINEAR", "BEZIER", "CONSTANT"): raise RuntimeError("--interp must be linear|bezier|constant")
+        holder = owner if hasattr(owner, "animation_data") else o
+        fc_path = attr if holder is owner and owner is not o else path
+        for fc in _fcurves(holder):
+            if fc.data_path == fc_path:
+                for kp in fc.keyframe_points:
+                    if abs(kp.co.x - frame) < 1e-6: kp.interpolation = interp
+    if extend:
+        if frame > sc.frame_end: sc.frame_end = frame; result["frame_end_extended"] = frame
+        if frame < sc.frame_start: sc.frame_start = frame; result["frame_start_extended"] = frame
+    if o.name not in touched: touched.append(o.name)
+    cur = getattr(owner, attr)
+    keyed.append({"object": o.name, "prop": path, "frame": frame,
+        "value": [round(float(v), 4) for v in cur] if hasattr(cur, "__len__") else round(float(cur), 4)})
+result["keyed"] = keyed
+def _summary(o):
+    s = _anim_summary(o)
+    # Keys on a dotted path like data.energy live on the DATA block's action.
+    d = getattr(o, "data", None)
+    if d is not None and getattr(d, "animation_data", None) is not None:
+        s["data"] = _anim_summary(d)
+    return s
+result["animation"] = {n: _summary(bpy.data.objects[n]) for n in touched}
+result["frame_range"] = [sc.frame_start, sc.frame_end]`;
+
+const MATERIAL_BODY = `o = bpy.data.objects.get(PARAMS["object"])
+if o is None: raise RuntimeError("no object named %r (objects: %s)" % (PARAMS["object"], ", ".join(sorted(x.name for x in bpy.data.objects)[:40]) or "none"))
+if o.type not in ("MESH", "CURVE", "FONT", "SURFACE", "META"): raise RuntimeError("object %s (%s) cannot carry a material" % (o.name, o.type))
+mname = PARAMS.get("name")
+mat = bpy.data.materials.get(mname) if mname else None
+created = mat is None
+if mat is None: mat = bpy.data.materials.new(mname or (o.name + "_mat"))
+if mat.node_tree is None: mat.use_nodes = True
+nt = mat.node_tree
+bsdf = next((n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None)
+if bsdf is None:
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    out_node = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None) or nt.nodes.new("ShaderNodeOutputMaterial")
+    nt.links.new(bsdf.outputs["BSDF"], out_node.inputs["Surface"])
+# Socket names moved in 4.0 (Emission -> Emission Color); try the new name first.
+def _set(names, value):
+    for nm in names:
+        s = bsdf.inputs.get(nm)
+        if s is None: continue
+        dv = s.default_value
+        if hasattr(dv, "__len__"):
+            v = list(value) if isinstance(value, (list, tuple)) else [float(value)] * 3
+            if len(v) == 3 and len(dv) == 4: v = v + [1.0]
+            if len(v) != len(dv): raise RuntimeError("%s expects %d values, got %d" % (nm, len(dv), len(v)))
+            s.default_value = v
+        else:
+            s.default_value = float(value[0] if isinstance(value, (list, tuple)) else value)
+        return nm
+    raise RuntimeError("this Blender's Principled BSDF has no socket named " + " / ".join(names))
+inputs = {}
+if PARAMS.get("color") is not None:
+    inputs["base_color"] = _set(["Base Color"], PARAMS["color"])
+    mat.diffuse_color = (list(PARAMS["color"]) + [1.0])[:4]
+if PARAMS.get("roughness") is not None: inputs["roughness"] = _set(["Roughness"], PARAMS["roughness"])
+if PARAMS.get("metallic") is not None: inputs["metallic"] = _set(["Metallic"], PARAMS["metallic"])
+if PARAMS.get("alpha") is not None: inputs["alpha"] = _set(["Alpha"], PARAMS["alpha"])
+if PARAMS.get("emission") is not None:
+    inputs["emission"] = _set(["Emission Color", "Emission"], PARAMS["emission"])
+    es = bsdf.inputs.get("Emission Strength")
+    if PARAMS.get("emission_strength") is None and es is not None and es.default_value == 0:
+        inputs["emission_strength"] = _set(["Emission Strength"], 1.0)
+if PARAMS.get("emission_strength") is not None: inputs["emission_strength"] = _set(["Emission Strength"], PARAMS["emission_strength"])
+if len(o.data.materials): o.data.materials[0] = mat
+else: o.data.materials.append(mat)
+result["material"] = {"object": o.name, "name": mat.name, "created": created, "inputs": inputs,
+    "slots": len(o.data.materials), "sockets": [s.name for s in bsdf.inputs][:14]}`;
+
+const parseNums = (s) => String(s).split(',').map(x => Number(x.trim()));
+function parseColor(s) {
+  const str = String(s).trim();
+  const hex = str.match(/^#?([0-9a-f]{6})$/i);
+  if (hex) return [0, 2, 4].map(i => parseInt(hex[1].slice(i, i + 2), 16) / 255);
+  const v = parseNums(str);
+  if (v.length !== 3 || v.some(n => !Number.isFinite(n))) throw new Error(`invalid colour: ${s} (use r,g,b in 0..1 or #rrggbb)`);
+  return v;
+}
+function parseJsonOps(raw, what) {
+  if (raw === true) throw new Error(`missing value for --json (a JSON list of ${what} ops)`);
+  let ops;
+  try { ops = JSON.parse(String(raw)); } catch (e) { throw new Error(`--json is not valid JSON: ${e.message}`); }
+  if (!Array.isArray(ops)) ops = [ops];
+  if (!ops.length) throw new Error('--json list is empty');
+  if (ops.some(o => !o || typeof o !== 'object')) throw new Error('--json entries must be objects');
+  return ops;
+}
+
+commands.add = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'name', 'at', 'rot', 'size', 'scale', 'look-at', 'type', 'energy', 'color', 'text', 'lens', 'json', ...COMMON_FLAGS]);
+  const usage = 'blender-cli add cube|sphere|icosphere|plane|cylinder|cone|torus|monkey|camera|light|empty|text [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z] [--type sun|point|spot|area] [--energy N] [--color r,g,b] [--text "..."] [--blend f] [--save f]   |   add --json \'[{"what":"cube","name":"A","at":[0,0,1]}, ...]\'';
+  let ops;
+  try {
+    if (flags.json !== undefined) ops = parseJsonOps(flags.json, 'add');
+    else {
+      if (!positional[0]) throw new Error('missing object kind');
+      ops = [{ what: positional[0], name: flags.name, at: flags.at, rot: flags.rot, size: flags.size, scale: flags.scale,
+        look_at: flags['look-at'], type: flags.type, energy: flags.energy, text: flags.text, lens: flags.lens, active: !!flags.active,
+        ...(flags.color !== undefined ? { color: flags.color } : {}) }];
+    }
+    for (const op of ops) if (typeof op.color === 'string') op.color = parseColor(op.color);
+  } catch (e) { show({ ok: false, error: e.message, usage }, ctx); process.exit(1); }
+  const r = runBlender(ADD_BODY, { blend: flags.blend, save: flags.save, params: { ops }, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+commands.keyframe = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'prop', 'frame', 'value', 'interp', 'json', ...COMMON_FLAGS]);
+  const usage = 'blender-cli keyframe <object> --frame N [--prop location|rotation|scale|<data.path>] [--value x,y,z] [--interp linear|bezier|constant] [--no-extend] [--blend f] [--save f]   |   keyframe --json \'[{"object":"Cube","prop":"location","frame":1,"value":[0,0,0]}, ...]\'';
+  let ops;
+  try {
+    if (flags.json !== undefined) ops = parseJsonOps(flags.json, 'keyframe');
+    else {
+      if (!positional[0]) throw new Error('missing object name');
+      if (flags.frame === undefined) throw new Error('missing --frame');
+      ops = [{ object: positional[0], prop: flags.prop, frame: flags.frame, value: flags.value, interp: flags.interp }];
+    }
+    for (const op of ops) {
+      if (!op.object) throw new Error('every keyframe needs an object name');
+      if (op.frame === undefined || op.frame === true || !Number.isInteger(Number(op.frame))) throw new Error(`invalid frame: ${op.frame} (an integer)`);
+    }
+  } catch (e) { show({ ok: false, error: e.message, usage }, ctx); process.exit(1); }
+  const params = { ops, extend: !flags['no-extend'], interp: typeof flags.interp === 'string' ? flags.interp : null };
+  const r = runBlender(KEYFRAME_BODY, { blend: flags.blend, save: flags.save, params, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+commands.material = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'name', 'color', 'roughness', 'metallic', 'alpha', 'emission', 'emission-strength', ...COMMON_FLAGS]);
+  const usage = 'blender-cli material <object> [--name M] [--color r,g,b|#hex] [--roughness 0..1] [--metallic 0..1] [--alpha 0..1] [--emission r,g,b] [--emission-strength N] [--blend f] [--save f]';
+  if (!positional[0]) { show({ ok: false, error: 'missing object name', usage }, ctx); process.exit(1); }
+  const params = { object: positional[0], name: typeof flags.name === 'string' ? flags.name : null };
+  try {
+    if (flags.color !== undefined) params.color = parseColor(flags.color);
+    if (flags.emission !== undefined) params.emission = parseColor(flags.emission);
+    for (const [key, flag] of [['roughness', 'roughness'], ['metallic', 'metallic'], ['alpha', 'alpha'], ['emission_strength', 'emission-strength']]) {
+      if (flags[flag] === undefined) continue;
+      const n = Number(flags[flag]);
+      if (flags[flag] === true || !Number.isFinite(n)) throw new Error(`invalid --${flag}: ${flags[flag]} (a number)`);
+      params[key] = n;
+    }
+  } catch (e) { show({ ok: false, error: e.message, usage }, ctx); process.exit(1); }
+  const r = runBlender(MATERIAL_BODY, { blend: flags.blend, save: flags.save, params, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// `blender-cli addon` — list / enable / disable / install add-ons and extensions
+// headless. A pipeline that needs an importer add-on has no UI to turn it on;
+// `enable` persists to user preferences by default (that is the point of it),
+// `--no-persist` tries it for this call only. `install` takes a legacy add-on
+// (.py or .zip) or an extension package (.zip with blender_manifest.toml, 4.2+).
+const ADDON_LIST_BODY = `import addon_utils
+show_all = bool(PARAMS.get("all"))
+enabled = set(a.module for a in bpy.context.preferences.addons)
+items = []
+for m in addon_utils.modules(refresh=True):
+    on = m.__name__ in enabled
+    if not show_all and not on: continue
+    info = addon_utils.module_bl_info(m)
+    ver = info.get("version")
+    items.append({"module": m.__name__, "name": info.get("name"), "version": ".".join(str(v) for v in ver) if ver else None,
+        "category": info.get("category"), "enabled": on, "extension": m.__name__.startswith("bl_ext.")})
+result["addons"] = items
+result["enabled"] = len(enabled)
+result["available"] = len(addon_utils.modules(refresh=False))
+result["paths"] = list(addon_utils.paths())`;
+
+const ADDON_TOGGLE_BODY = `import addon_utils
+m = PARAMS["module"]
+if PARAMS["action"] == "enable":
+    if addon_utils.enable(m, default_set=True) is None:
+        raise RuntimeError("could not enable add-on %r: not installed, or it failed to register (blender-cli addon list --all shows what is installed)" % m)
+else:
+    if m not in bpy.context.preferences.addons: raise RuntimeError("add-on %r is not enabled" % m)
+    addon_utils.disable(m, default_set=True)
+if PARAMS.get("persist"): bpy.ops.wm.save_userpref()
+result["module"] = m
+result["enabled"] = m in bpy.context.preferences.addons
+result["persisted"] = bool(PARAMS.get("persist"))`;
+
+const ADDON_INSTALL_BODY = `import addon_utils, zipfile
+p = PARAMS["file"]
+before = set(m.__name__ for m in addon_utils.modules(refresh=True))
+is_ext = False
+if p.lower().endswith(".zip"):
+    with zipfile.ZipFile(p) as z:
+        is_ext = any(n.split("/")[-1] == "blender_manifest.toml" and n.count("/") <= 1 for n in z.namelist())
+if is_ext:
+    if "package_install_files" not in dir(bpy.ops.extensions):
+        raise RuntimeError("this file is a Blender extension (blender_manifest.toml) but this Blender has no extensions system (needs 4.2+)")
+    bpy.ops.extensions.package_install_files(filepath=p, repo="user_default", enable_on_install=bool(PARAMS.get("enable")))
+else:
+    bpy.ops.preferences.addon_install(filepath=p, overwrite=True)
+after = set(m.__name__ for m in addon_utils.modules(refresh=True))
+new = sorted(after - before)
+module = new[0] if len(new) == 1 else None
+if module is None and not is_ext:
+    stem = os.path.basename(p).rsplit(".", 1)[0]
+    if stem in after: module = stem
+result["installed"] = {"file": p, "kind": "extension" if is_ext else "addon", "modules_added": new, "module": module}
+if PARAMS.get("enable") and not is_ext:
+    if module is None: raise RuntimeError("installed, but could not tell which module to enable (candidates: %s)" % (", ".join(new) or "none"))
+    if addon_utils.enable(module, default_set=True) is None: raise RuntimeError("installed %s but enabling it failed (see logs)" % module)
+if PARAMS.get("enable") and PARAMS.get("persist"): bpy.ops.wm.save_userpref()
+result["enabled"] = bool(module and module in bpy.context.preferences.addons)`;
+
+commands.addon = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, COMMON_FLAGS);
+  const [sub, target] = positional;
+  const usage = 'blender-cli addon list [--all] | enable <module> [--no-persist] | disable <module> [--no-persist] | install <file.py|.zip> [--enable] [--no-persist]';
+  const persist = !flags['no-persist'];
+  let r;
+  if (sub === 'list') r = runBlender(ADDON_LIST_BODY, { params: { all: !!flags.all }, flags });
+  else if (sub === 'enable' || sub === 'disable') {
+    if (!target) { show({ ok: false, error: `missing module name for addon ${sub}`, usage }, ctx); process.exit(1); }
+    r = runBlender(ADDON_TOGGLE_BODY, { params: { module: target, action: sub, persist }, flags });
+  } else if (sub === 'install') {
+    if (!target || !existsSync(target)) { show({ ok: false, error: `add-on file not found: ${target || '(none given)'}`, usage }, ctx); process.exit(1); }
+    r = runBlender(ADDON_INSTALL_BODY, { params: { file: resolve(target), enable: !!flags.enable, persist }, flags });
+  } else { show({ ok: false, error: `unknown addon subcommand: ${sub || '(none)'}`, usage }, ctx); process.exit(1); }
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// `blender-cli job` — the other half of --detach.
+commands.job = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['timeout', 'poll']);
+  const [sub, id] = positional;
+  const usage = 'blender-cli job list | status <id> | wait <id> [--timeout sec] [--poll sec] | cancel <id>';
+  if (sub === 'list') {
+    let ids = [];
+    try { ids = readdirSync(JOBS_DIR).filter(d => existsSync(join(JOBS_DIR, d, 'job.json'))).sort().reverse(); } catch { /* no jobs yet */ }
+    const jobs = ids.map(j => { const s = jobStatus(j); return { job: s.job, status: s.status, command: s.command, started: s.started, elapsed_s: s.elapsed_s, progress: s.progress, out: s.out }; });
+    show({ ok: true, jobs, running: jobs.filter(j => j.status === 'running').length, dir: JOBS_DIR }, ctx);
+    return;
+  }
+  if (sub === 'status') { const r = jobStatus(id); show(r, ctx); if (!r.ok) process.exit(1); return; }
+  if (sub === 'wait') {
+    if (!readJob(id)) { show({ ok: false, error: `unknown job: ${id || '(none given)'}`, hint: 'blender-cli job list' }, ctx); process.exit(1); }
+    const limit = flags.timeout !== undefined ? Number(flags.timeout) : 0;
+    if (flags.timeout !== undefined && !(limit > 0)) { show({ ok: false, error: `invalid --timeout: ${flags.timeout} (whole seconds)` }, ctx); process.exit(1); }
+    const poll = Math.max(0.2, Number(flags.poll) || 2);
+    const deadline = limit ? Date.now() + limit * 1000 : Infinity;
+    let r = jobStatus(id);
+    while (r.status === 'running' && Date.now() < deadline) {
+      await new Promise(rs => setTimeout(rs, poll * 1000));
+      r = jobStatus(id);
+    }
+    if (r.status === 'running') { r.ok = false; r.error = `still running after ${limit}s (left running; blender-cli job cancel ${id} stops it)`; }
+    show(r, ctx); if (!r.ok) process.exit(1);
+    return;
+  }
+  if (sub === 'cancel') {
+    const before = jobStatus(id);
+    if (!before.job) { show(before, ctx); process.exit(1); }
+    if (before.status === 'running') { try { process.kill(before.pid, 'SIGKILL'); } catch { /* raced with exit */ } }
+    const job = readJob(id);
+    job.status = before.status === 'running' ? 'cancelled' : before.status;
+    job.finished = job.finished || new Date().toISOString();
+    writeJob(job);
+    show({ ok: true, job: id, status: job.status, was: before.status }, ctx);
+    return;
+  }
+  show({ ok: false, error: `unknown job subcommand: ${sub || '(none)'}`, usage }, ctx); process.exit(1);
+};
+
+// --- Machine-readable command manifest ---------------------------------------
+// Agents and harnesses should not have to scrape --help. `schema` emits the
+// whole surface as JSON with an EFFECTS annotation per command (what it reads,
+// mutates, writes or reaches), and `schema --skill` renders a drop-in skill
+// file. The smoke suite fails if a command exists without a spec or vice versa.
+const EFFECTS = {
+  read: 'inspects only; writes nothing',
+  scene: 'mutates the loaded scene in memory; persisted only with --save',
+  files: 'writes files at the paths you give (overwrites)',
+  code: 'executes agent-authored Python inside Blender; gate it with --check / --safe',
+  network: 'calls an external service',
+  prefs: 'changes Blender user preferences on this machine',
+  process: 'starts or stops a background Blender process',
+};
+const FL = (name, value, doc) => ({ name, value, doc });
+const COMMON_SPEC_FLAGS = [
+  FL('blender', 'path', 'Blender binary to use (else BLENDER_BIN, then auto-detect)'),
+  FL('timeout', 'sec', 'kill Blender after this many seconds'),
+  FL('addons', 'a,b', 'enable these add-on / extension modules for this call'),
+  FL('human', null, 'pretty-print the JSON (also -H)'),
+];
+const BLEND_FLAGS = [FL('blend', 'path', 'the .blend to load (else an empty scene)'), FL('save', 'path', 'write the resulting .blend')];
+const COMMAND_SPECS = [
+  { name: 'doctor', effects: ['read'], usage: 'blender-cli doctor', flags: [],
+    summary: 'Locate Blender, verify headless bpy, report version support, import/export formats, engines, GPU devices, enabled add-ons and API generation. Run first.' },
+  { name: 'new', effects: ['files'], usage: 'blender-cli new <name> [--save f.blend]', flags: [FL('save', 'path', 'where to write (default ./<name>.blend)')],
+    summary: 'Scaffold a clean project (camera + key light + 1080p) and save it.' },
+  { name: 'exec', effects: ['code', 'scene'], usage: 'blender-cli exec "<bpy>" [--blend f] [--save f] [--check] [--safe] [--detach]',
+    flags: [...BLEND_FLAGS, FL('check', null, 'compile + flag risky calls + version-specific API drift, execute nothing'), FL('safe', null, 'refuse code that trips the AST gate'), FL('unsafe', null, 'override BLENDER_CLI_SAFE=1'), FL('detach', null, 'run as a background job; poll with job status')],
+    summary: 'Run agent-authored bpy; keys set on result come back as JSON. A failure on a known API move carries api_drift hints.' },
+  { name: 'run', effects: ['code', 'scene'], usage: 'blender-cli run <script.py> [--blend f] [--save f] [--check] [--safe] [--detach]', flags: [...BLEND_FLAGS, FL('check', null, 'as exec'), FL('safe', null, 'as exec'), FL('detach', null, 'as exec')],
+    summary: 'Same as exec, from a .py file.' },
+  { name: 'scene', effects: ['read'], usage: 'blender-cli scene [--blend f]', flags: [BLEND_FLAGS[0]],
+    summary: 'Dump objects (transforms, F-curve and keyframe counts), frame range, engine, resolution, materials, cameras and lights as JSON.' },
+  { name: 'verify', effects: ['read'], usage: 'blender-cli verify [--blend f] [--tolerance 0.001] [--fail-on error|warn|none] [--no-mesh]',
+    flags: [BLEND_FLAGS[0], FL('tolerance', 'units', 'overlap depth that counts'), FL('fail-on', 'tier', 'which finding tier makes exit 1 (default error)'), FL('no-mesh', null, 'skip the per-mesh bmesh pass')],
+    summary: 'Lint the scene: missing camera, empty meshes, bad transforms, real overlaps, off-camera objects, plus mesh health (loose geometry, non-manifold, zero-area faces, winding, convex colliders, modifier order).' },
+  { name: 'snapshot', effects: ['files'], usage: 'blender-cli snapshot [--blend f] --out sheet.png [--views front,right,top,persp] [--res 512x384] [--shading random|material|solid] [--frame N]',
+    flags: [BLEND_FLAGS[0], FL('out', 'path', 'PNG contact sheet to write'), FL('views', 'list', 'front back right left top bottom persp'), FL('res', 'WxH', 'tile size'), FL('shading', 'mode', 'random | material | solid'), FL('frame', 'N', 'frame to snapshot'), FL('bg', '0..1', 'sheet background grey')],
+    summary: 'Cheap multi-view Workbench capture tiled into one PNG, with per-view coverage, occupied bbox, luminance and a blank flag, so the build can be checked without a full render.' },
+  { name: 'add', effects: ['scene'], usage: 'blender-cli add <kind> [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z] [--type T] [--energy N] [--color c] [--text T] [--blend f] [--save f] | add --json "[...]"',
+    flags: [...BLEND_FLAGS, FL('json', 'list', 'batch of ops in one launch: [{"what":"cube","name":"A","at":[0,0,1]}]')],
+    summary: 'Add a primitive (cube sphere icosphere plane cylinder cone torus monkey), camera, light, empty or text by name, in one Blender launch; returns the resulting objects.' },
+  { name: 'keyframe', effects: ['scene'], usage: 'blender-cli keyframe <object> --frame N [--prop location|rotation|scale|<data.path>] [--value x,y,z] [--interp linear|bezier|constant] [--no-extend] [--blend f] [--save f] | keyframe --json "[...]"',
+    flags: [...BLEND_FLAGS, FL('json', 'list', 'batch of keys in one launch'), FL('no-extend', null, 'do not grow the scene frame range to the keyed frame')],
+    summary: 'Set a property and insert a keyframe on a named object (rotation in degrees); works on both legacy and slotted actions; returns per-object keyframe counts.' },
+  { name: 'material', effects: ['scene'], usage: 'blender-cli material <object> [--name M] [--color r,g,b|#hex] [--roughness x] [--metallic x] [--alpha x] [--emission c] [--emission-strength x] [--blend f] [--save f]', flags: [...BLEND_FLAGS],
+    summary: 'Create or update a Principled BSDF material and assign it to a named object, using the 4.0+ socket names with fallbacks.' },
+  { name: 'import', effects: ['scene', 'network'], usage: 'blender-cli import <file | polyhaven:id> [--blend f] [--save f] [--type hdri|texture|model] [--res 1k|2k|4k] | import --batch "assets/*.glb"',
+    flags: [...BLEND_FLAGS, FL('type', 'kind', 'Poly Haven asset kind'), FL('res', 'res', 'Poly Haven resolution'), FL('batch', 'glob', 'gather many files into one scene')],
+    summary: 'Import glb gltf obj fbx stl ply usd abc dae, or fetch + import a Poly Haven asset (network). Reports what arrived.' },
+  { name: 'generate', effects: ['network', 'files', 'scene'], usage: 'blender-cli generate "<prompt>" | generate --image ref.png [--out f.glb] [--import] [--wait sec]',
+    flags: [...BLEND_FLAGS, FL('out', 'path', 'GLB to write'), FL('import', null, 'import the result into the scene'), FL('wait', 'sec', 'polling budget'), FL('image', 'path', 'image-to-3D reference')],
+    summary: 'Text- or image-to-3D via Meshy (needs MESHY_API_KEY); downloads the GLB, optionally imports it.' },
+  { name: 'export', effects: ['files'], usage: 'blender-cli export <out.glb|gltf|obj|fbx|stl|ply|usd> [--blend f] [--selected] [--no-verify] [--strict] [--animations on|off] | export <dir> --batch "b/*.blend" --format glb',
+    flags: [BLEND_FLAGS[0], FL('selected', null, 'selected objects only'), FL('no-verify', null, 'skip the readback census'), FL('strict', null, 'degraded fidelity is exit 1'), FL('animations', 'on|off', 'write animation (default on)'), FL('batch', 'glob', 'one export per .blend'), FL('format', 'ext', 'batch output format')],
+    summary: 'Write the scene out, read it back and report a fidelity census (meshes, verts, materials, UVs, colour attrs, shape keys, animated objects) compared only on what the format can carry.' },
+  { name: 'render', effects: ['files', 'process'], usage: 'blender-cli render [--blend f] --out p.png [--frame N] [--res WxH] [--engine E] [--device auto|cpu|cuda|optix|metal|hip|oneapi] [--threads N] [--samples N] [--denoise on|off] [--detach] | render --animation --out clip.mp4 [--frames 1..48] [--fps 24] | render --batch "shots/*.blend" --out dir/',
+    flags: [BLEND_FLAGS[0], FL('out', 'path', 'image, video or sequence target'), FL('animation', null, 'render the frame range'), FL('frames', 'a..b', 'frame range'), FL('frame', 'N', 'still frame'), FL('engine', 'name', 'cycles | eevee | workbench'), FL('device', 'name', 'auto picks the best GPU backend, else cpu'), FL('threads', 'N', 'fixed CPU thread count'), FL('samples', 'N', 'render samples'), FL('denoise', 'on|off', 'Cycles denoising'), FL('detach', null, 'background job; poll with job status'), FL('batch', 'glob', 'one render per .blend'), FL('ext', 'ext', 'batch output extension')],
+    summary: 'Render a still, a video/PNG sequence, or a batch; the result reports engine, device, samples, resolution, bytes and duration. --detach returns a job id at once.' },
+  { name: 'job', effects: ['process'], usage: 'blender-cli job list | status <id> | wait <id> [--timeout sec] [--poll sec] | cancel <id>',
+    flags: [FL('timeout', 'sec', 'wait: give up (job keeps running)'), FL('poll', 'sec', 'wait: poll interval')],
+    summary: 'Inspect, wait for or cancel detached renders/execs; status reports frames done (and percent when the range is known) or the final result.' },
+  { name: 'addon', effects: ['prefs', 'files'], usage: 'blender-cli addon list [--all] | enable <module> [--no-persist] | disable <module> | install <file.py|.zip> [--enable]',
+    flags: [FL('all', null, 'list disabled modules too'), FL('no-persist', null, 'do not write user preferences'), FL('enable', null, 'install: enable after installing')],
+    summary: 'List, enable, disable or install add-ons and extensions headless; enable persists to user preferences unless --no-persist.' },
+  { name: 'schema', effects: ['read'], usage: 'blender-cli schema [--skill] [--out file]', flags: [FL('skill', null, 'render a SKILL.md instead of JSON'), FL('out', 'path', 'write to a file')],
+    summary: 'This manifest: every command with its effects, flags and usage, as JSON or as a drop-in agent skill file.' },
+  { name: 'version', effects: ['read'], usage: 'blender-cli version', flags: [], summary: 'Print name and version.' },
+];
+
+function renderSkill(m) {
+  const rows = m.commands.map(c => `| \`${c.usage}\` | ${c.effects.join(', ')} | ${c.summary} |`).join('\n');
+  const legend = Object.entries(m.effects_legend).map(([k, v]) => `- **${k}**: ${v}`).join('\n');
+  const common = m.contract.common_flags.map(f => `\`--${f.name}${f.value ? ' <' + f.value + '>' : ''}\``).join(', ');
+  return `---
+name: blender-cli
+description: Drive a local Blender headless from the shell: scaffold, build, animate, verify, render and export 3D scenes with JSON in and JSON out. Use when a task needs Blender without a GUI, an MCP server or an add-on.
+---
+
+# blender-cli ${m.version}
+
+Run \`blender-cli doctor\` first. Every command prints ONE JSON object on stdout and exits 1 exactly when \`ok\` is false; add \`-H\` to pretty-print. Nothing persists unless you pass \`--save\` (scene state) or an output path (\`render\`, \`export\`, \`snapshot\`).
+
+## The loop
+
+1. Build: \`new\`, \`import\`, \`add\`, \`material\`, \`keyframe\`, or \`exec\` for anything else bpy can do (gate it with \`--check\` / \`--safe\`).
+2. Look: \`scene\` (state), \`verify\` (lint), \`snapshot\` (multi-view contact sheet with coverage stats).
+3. Deliver: \`render\` (still or \`--animation\`; \`--detach\` then \`job wait\` for long ones), \`export\` (with a fidelity census).
+
+## Commands
+
+| usage | effects | what it does |
+|---|---|---|
+${rows}
+
+## Effects
+
+${legend}
+
+Common flags on every Blender-running command: ${common}. Machine-readable version of this file: \`blender-cli schema\`.
+`;
+}
+
+commands.schema = (args, ctx) => {
+  const { flags } = fdn.parseArgs(args, ['out']);
+  const manifest = {
+    name: PKG.name, version: PKG.version, description: PKG.description,
+    contract: {
+      output: 'one JSON object on stdout per invocation; -H pretty-prints',
+      exit_code: '1 exactly when ok is false',
+      persistence: 'scene changes persist only with --save; render/export/snapshot write to the path given',
+      env: { BLENDER_BIN: 'Blender binary override', BLENDER_CLI_SAFE: '1 makes --safe the default', MESHY_API_KEY: 'text/image-to-3D backend' },
+      common_flags: COMMON_SPEC_FLAGS,
+    },
+    effects_legend: EFFECTS,
+    commands: COMMAND_SPECS,
+  };
+  if (flags.out === true) { show({ ok: false, error: 'missing value for --out' }, ctx); process.exit(1); }
+  if (flags.skill) {
+    const md = renderSkill(manifest);
+    if (flags.out) { writeFileSync(resolve(flags.out), md); show({ ok: true, written: resolve(flags.out), bytes: Buffer.byteLength(md), format: 'skill' }, ctx); }
+    else process.stdout.write(md);
+    return;
+  }
+  if (flags.out) { writeFileSync(resolve(flags.out), JSON.stringify(manifest, null, 2) + '\n'); show({ ok: true, written: resolve(flags.out), commands: COMMAND_SPECS.length, format: 'json' }, ctx); return; }
+  show(manifest, ctx);
+};
+
 commands.version = (args, ctx) => show({ name: PKG.name, version: PKG.version }, ctx);
 
 commands.help = () => {
   console.error(`blender-cli ${PKG.version} — drive Blender headless from your agent (JSON out; -H pretty-prints)
 
-Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--human]
+Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addons a,b] [--human]
 
   doctor                       find Blender, verify headless bpy, report version support,
-                               import/export formats, video support, GPU devices   <-- run this first
+                               formats, engines, GPU devices, enabled add-ons, API generation   <-- run this first
   new <name> [--save f.blend]  scaffold a clean project (camera + key light + 1080p)
-  exec "<bpy>"  [--blend f] [--save f] [--check] [--safe]   run agent-authored bpy; set result[...] keys -> JSON back
-  run <script.py> [--blend f] [--save f] [--check] [--safe] same, from a .py file
+  exec "<bpy>"  [--blend f] [--save f] [--check] [--safe] [--detach]   run agent-authored bpy; result[...] keys -> JSON back
+  run <script.py> [--blend f] [--save f] [--check] [--safe] [--detach] same, from a .py file
   scene [--blend f]            dump objects / frame range / engine / materials / keyframes as JSON
-  verify [--blend f] [--tolerance 0.001] [--fail-on error|warn|none]
+  verify [--blend f] [--tolerance 0.001] [--fail-on error|warn|none] [--no-mesh]
                                lint the scene before you spend a render on it: missing camera,
                                empty meshes, NaN/degenerate transforms, unapplied non-uniform
-                               scale, off-camera objects, real (not merely touching) overlaps
+                               scale, off-camera objects, real (not merely touching) overlaps,
+                               and per-mesh health: loose geometry, non-manifold edges, zero-area
+                               faces, inconsistent/inverted normals, non-convex UCX_ colliders,
+                               Multires-not-last and Mirror-after-Subsurf modifier stacks
+  snapshot [--blend f] --out sheet.png [--views front,right,top,persp] [--res 512x384] [--shading random|material|solid]
+                               cheap Workbench contact sheet + per-view coverage/bbox/luminance
+                               stats, so the agent can see what it built without a real render
+  add cube|sphere|icosphere|plane|cylinder|cone|torus|monkey|camera|light|empty|text
+      [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z]
+      [--type sun|point|spot|area] [--energy N] [--color r,g,b] [--text "..."] [--blend f] [--save f]
+  add --json '[{"what":"cube","name":"A","at":[0,0,1]}, ...]'   many objects in ONE launch
+  keyframe <object> --frame N [--prop location|rotation|scale|<data.path>] [--value x,y,z]
+      [--interp linear|bezier|constant] [--no-extend] [--blend f] [--save f]   (rotation in degrees)
+  keyframe --json '[{"object":"A","prop":"location","frame":1,"value":[0,0,0]}, ...]'
+  material <object> [--name M] [--color r,g,b|#hex] [--roughness x] [--metallic x] [--alpha x]
+      [--emission r,g,b] [--emission-strength x] [--blend f] [--save f]
   import <file> [--blend f] [--save f]   pull an asset in: glb gltf obj fbx stl ply usd abc dae
   import polyhaven:<id> [--type hdri|texture|model] [--res 1k|2k|4k]   fetch + import a Poly Haven asset
          (model -> objects, hdri -> world environment, texture -> wired PBR material; cached in ~/.cache)
   import --batch "assets/*.glb" [--save f]   gather many files into ONE scene
   generate "<prompt>" [--out f.glb] [--import] [--wait sec]  text-to-3D via Meshy (needs MESHY_API_KEY)
   generate --image ref.png [--out f.glb] [--import]          image-to-3D from a reference photo
-  export <out.glb> [--blend f] [--selected] [--no-verify] [--strict]
+  export <out.glb> [--blend f] [--selected] [--no-verify] [--strict] [--animations on|off]
                                hand the scene on: glb gltf obj fbx stl ply usd. Reads the file
                                BACK and reports a fidelity census (verts/materials/uv/colour
-                               attrs/shape keys), compared only on what the format can carry.
+                               attrs/shape keys/animated objects), compared only on what the
+                               format can carry.
   export <out-dir> --batch "blends/*.blend" --format glb     one export per .blend
   render [--blend f] --out preview.png [--frame N] [--res 1280x720]
-         [--engine cycles|eevee|workbench] [--device cpu|cuda|optix|metal|hip|oneapi] [--samples N] [--denoise on|off]
+         [--engine cycles|eevee|workbench] [--device auto|cpu|cuda|optix|metal|hip|oneapi]
+         [--threads N] [--samples N] [--denoise on|off] [--detach]
   render --animation --out clip.mp4 [--frames 1..48] [--fps 24] [...]  render the frame range
          (MP4/MOV/WEBM via Blender's ffmpeg, or a PNG sequence for any other --out)
   render --batch "shots/*.blend" --out renders/ [--ext png]  one render per .blend
+  job list | status <id> | wait <id> [--timeout sec] | cancel <id>
+                               the other half of --detach: progress (frames done / percent),
+                               then the final result once Blender is finished
+  addon list [--all] | enable <module> [--no-persist] | disable <module> | install <file.py|.zip> [--enable]
+                               add-ons and extensions, headless; enable persists to user prefs
+  schema [--skill] [--out f]   the whole command surface as JSON with effects annotations,
+                               or as a drop-in SKILL.md for your agent
   version                      print name + version
 
-Guardrails: --check compiles agent code + flags risky calls without executing;
+Guardrails: --check compiles agent code, flags risky calls AND version-specific API drift
+(api_drift) without executing; a failed exec carries the matching drift hints too.
 --safe REFUSES code that trips the AST gate (banned imports/calls, write-mode open;
 set BLENDER_CLI_SAFE=1 to make it the default, --unsafe to override);
---timeout <sec> kills a hung Blender instead of hanging your agent.
+--timeout <sec> kills a hung Blender instead of hanging your agent;
+--detach returns a job id at once for renders/execs that outlast your tool-call limit.
+--addons a,b enables add-ons for one call and fails loudly if a module is missing.
 Batch: quote the pattern (* and ? in the last segment, no **); every file runs and
 failures are reported per item, with a non-zero exit if any failed.
 Env: BLENDER_BIN overrides the binary (auto-detected on macOS / Linux / snap / flatpak /

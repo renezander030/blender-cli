@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0 (2026-09-10)
+
+Nine additions. Theme: **build, look and ship without writing bpy, and without outliving your own tool-call limit.** The suite grew from 35 to 71 checks, run green on Blender 5.1.1.
+
+### Added
+
+- `addon list [--all] | enable <module> [--no-persist] | disable <module> [--no-persist] | install <file.py|.zip> [--enable]`: add-ons and extensions headless. `enable` persists to user preferences by default; `install` handles legacy add-ons and extension packages (`blender_manifest.toml`, 4.2+). Every Blender-running command also accepts `--addons a,b` for one call; Blender's own `--addons` only warns on a missing module, so the wrapper re-checks and fails loudly, listing what is installed.
+- `--detach` on `render`, `exec` and `run`, plus `job list | status <id> | wait <id> [--timeout sec] [--poll sec] | cancel <id>`. A detached run returns a job id at once; status reports frames done (and percent when the frame range was given) parsed from Blender's own console lines (`Fra:`, `Saved:`, `Append frame`, with the 5.x timestamp prefix), then the final result. Jobs live in `~/.cache/blender-cli/jobs` (`BLENDER_CLI_JOBS_DIR` overrides). `--timeout` on a detached run is enforced by `job status`.
+- `snapshot [--blend f] --out sheet.png [--views ...] [--res WxH] [--shading random|material|solid] [--frame N]`: Workbench renders of front/right/top (orthographic, fitted to the scene bounds) and a fitted 3/4 perspective, tiled into one PNG, with per-view coverage (from the alpha channel), occupied bbox, luminance and a `blank` flag. Fails loudly when nothing is visible.
+- `add <kind> ...` / `add --json '[...]'`: primitives (`cube sphere icosphere plane cylinder cone torus monkey`), `camera` (with `--look-at`), `light` (`--type --energy --color`), `empty`, `text`, all by name, batch in one launch, returning the objects as built.
+- `keyframe <object> --frame N [--prop ...] [--value ...] [--interp ...] [--no-extend]` / `keyframe --json '[...]'`: sets and keys `location|rotation|scale` (rotation in degrees) or any dotted data path (`data.energy` keys the data block); extends the scene frame range to the keyed frame; reads legacy and slotted actions alike.
+- `material <object> [--name] [--color r,g,b|#hex] [--roughness] [--metallic] [--alpha] [--emission] [--emission-strength]`: Principled BSDF with the 4.0+ socket names (falls back to older names), assigned to slot 0.
+- `schema [--skill] [--out file]`: the whole command surface as JSON, each command annotated with effects (`read scene files code network prefs process`), flags, usage and summary; `--skill` renders a drop-in SKILL.md. The smoke suite fails if the spec set and the command set diverge.
+- **API drift guard.** A table of known bpy moves keyed to the Blender version they landed in (`Action.fcurves` removal, `Scene.node_tree` → `compositing_node_group`, `use_nodes` deprecation, `import_scene.obj` / `import_mesh.stl` removals, both EEVEE renames, the 4.0 Principled socket renames, context-dict overrides, `Object.select`, `scene.objects.active`, HEMI lights, `"rotation"` as a data path). `exec --check` reports the rows that apply to the build in use as `api_drift`; a failed `exec`/`run` appends the matching hints. `doctor` reports the live `api` generation (`actions`, `compositor`, `eevee_engine_id`, `obj_io`, `stl_io`, `extensions`) and `addons_enabled`.
+- `render --device auto` (OPTIX > CUDA > HIP > METAL > ONEAPI, else CPU) and `--threads N`; the render result now carries `device` (requested, type, names) and `threads`.
+- `verify` mesh health, per mesh via bmesh: `loose_geometry`, `non_manifold`, `zero_area_faces`, `inconsistent_normals`, `inverted_normals`, `open_mesh` (info), `concave_collider` (error, for `UCX_`/`UBX_`/`USP_`/`UCP_`-prefixed objects, tested on a triangulated copy), `multires_not_last` (error), `mirror_after_subsurf`, `modifiers_pending` (info); stats under `verified.mesh`; `--no-mesh` skips the pass; meshes over 500k vertices are skipped with a note.
+- Export fidelity census compares `animated` (objects with two or more keys) for glb/gltf/fbx, which round-trip animation; USD is written with animation (`export_animation`) but not judged on it, since Blender's USD importer does not read it back as keyframes. `--animations on|off` controls export; `exported.animation` reports objects, keyframes and whether it was written.
+
+### Fixed
+
+- **`scene` crashed on any animated file under Blender 5.x** (`'Action' object has no attribute 'fcurves'`): 4.4 introduced slotted actions and 5.0 removed the legacy accessor. A version-aware reader now serves `scene`, `keyframe` and the export census.
+
+### Changed
+
+- `scene` objects report `fcurves`, `keyframes` (keyframe points) and `frames` (first and last keyed frame) instead of a single `keyframes` field that actually counted F-curves.
+- `TESTED_VERSIONS` lists only what this release's suite was actually run on (5.1). 4.3.2 and 5.2.0 were green at 0.3.0 and rejoin the matrix once `node test/smoke.mjs --blender <path>` passes on them again; `doctor` reports them `untested` until then, by design.
+- Blender 5.1.1's own FBX importer fails on scenes containing lights; an FBX export of such a scene now reports `fidelity.checked: false` with that reason (documented; the exporter itself is fine).
+
 ## 0.3.0 (2026-07-25)
 
 Blender 5.x support, and a release theme of **trust the output**: 0.1.0 and 0.2.0 built the pipeline (import, generate, render, export), and this one makes what comes out of it checkable. Six items, each mined from cited, recent pain in the agent-Blender ecosystem, and the whole surface is now exercised by a smoke suite run against both Blender 4.3.2 and 5.2.0.
