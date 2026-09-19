@@ -6,9 +6,10 @@
 
 import * as fdn from './foundation.js';
 import { spawnSync, spawn } from 'node:child_process';
-import { writeFileSync, existsSync, readFileSync, mkdtempSync, readdirSync, mkdirSync, statSync, openSync, closeSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync, readSync, mkdtempSync, readdirSync, mkdirSync, statSync, openSync, closeSync, renameSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve, dirname, basename, sep } from 'node:path';
+import { createHash } from 'node:crypto';
 
 const DIR = fdn.dirOf(import.meta.url);
 const env = fdn.loadEnv(`${DIR}/.env`);
@@ -16,6 +17,30 @@ const PKG = JSON.parse(readFileSync(join(DIR, 'package.json'), 'utf8'));
 
 // Consistent output: terse JSON line by default, pretty JSON with -H/--human.
 const show = (r, ctx) => fdn.emit(r, { human: ctx?.human, table: () => JSON.stringify(r, null, 2) });
+
+function fileProof(path) {
+  const p = resolve(path);
+  if (!existsSync(p)) throw new Error(`artifact not found: ${p}`);
+  const bytes = statSync(p).size;
+  if (bytes <= 0) throw new Error(`artifact is empty: ${p}`);
+  const hash = createHash('sha256');
+  const fd = openSync(p, 'r');
+  const chunk = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    let read;
+    while ((read = readSync(fd, chunk, 0, chunk.length, null)) > 0) hash.update(chunk.subarray(0, read));
+  } finally { closeSync(fd); }
+  return { path: p, bytes, sha256: hash.digest('hex') };
+}
+
+function writeJsonAtomic(path, value) {
+  const p = resolve(path);
+  mkdirSync(dirname(p), { recursive: true });
+  const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+  renameSync(tmp, p);
+  return p;
+}
 
 // Flags every Blender-running command accepts: --blender <path>, --timeout <sec>
 // and --addons a,b (enable add-ons/extensions for this one call).
@@ -377,8 +402,14 @@ async function fetchJson(url, headers = {}) {
 
 const PH_TYPE_NAMES = { 0: 'hdri', 1: 'texture', 2: 'model' };
 const PH_NON_MAP_KEYS = new Set(['blend', 'gltf', 'usd', 'fbx', 'mtlx']);
+const PH_MAP_ALIASES = {
+  diffuse: ['diffuse', 'diff', 'albedo'], color: ['diffuse', 'diff', 'albedo'],
+  roughness: ['roughness', 'rough'], rough: ['roughness', 'rough'],
+  normal: ['normal', 'nor_gl', 'nor_dx'], metallic: ['metallic', 'metal'], metal: ['metallic', 'metal'],
+  displacement: ['displacement', 'disp'], height: ['displacement', 'disp'], opacity: ['opacity', 'alpha'],
+};
 
-async function polyhavenDownload(assetId, { type, res }) {
+async function polyhavenDownload(assetId, { type, res, maps = null }) {
   if (type && !['hdri', 'texture', 'model'].includes(type)) throw new Error(`invalid --type: ${type} (use hdri|texture|model)`);
   let info;
   try { info = await fetchJson(`https://api.polyhaven.com/info/${assetId}`); }
@@ -388,7 +419,9 @@ async function polyhavenDownload(assetId, { type, res }) {
   catch (e) { throw new Error(`polyhaven files ${assetId}: ${e.message}`); }
   const kind = type || PH_TYPE_NAMES[info.type] || 'texture';
   const outDir = join(homedir(), '.cache', 'blender-cli', 'polyhaven', assetId, res);
-  const dl = { kind, files: [], cached: 0 };
+  const wanted = maps?.length ? maps.map(x => x.toLowerCase()) : null;
+  const dl = { kind, files: [], cached: 0, cache_dir: outDir,
+    provenance: { provider: 'Poly Haven', source_url: `https://polyhaven.com/a/${assetId}`, license: 'CC0' } };
   const grab = async (url, dest, size) => {
     const d = await downloadTo(url, dest, size ?? null);
     if (d.cached) dl.cached++;
@@ -415,6 +448,8 @@ async function polyhavenDownload(assetId, { type, res }) {
     const maps = {};
     for (const [mapName, byRes] of Object.entries(files)) {
       if (PH_NON_MAP_KEYS.has(mapName)) continue;
+      const mn = mapName.toLowerCase();
+      if (wanted && !wanted.some(w => [w, ...(PH_MAP_ALIASES[w] || [])].some(a => mn === a || mn.startsWith(a) || mn.includes(a)))) continue;
       const fmt = byRes?.[res] && (byRes[res].jpg || byRes[res].png || byRes[res].exr);
       if (!fmt) continue;
       maps[mapName] = await grab(fmt.url, join(outDir, basename(new URL(fmt.url).pathname)), fmt.size);
@@ -440,8 +475,9 @@ elif ext == "abc": bpy.ops.wm.alembic_import(filepath=p)
 elif ext == "dae": bpy.ops.wm.collada_import(filepath=p)
 else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz abc dae)")
 added = [o for o in bpy.data.objects if o.name not in before]
+if PARAMS.get("pack"): bpy.ops.file.pack_all()
 result["imported"] = {"file": p, "format": ext, "objects": [{"name": o.name, "type": o.type} for o in added],
-    "count": len(added), "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH")}`;
+    "count": len(added), "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH"), "packed": bool(PARAMS.get("pack"))}`;
 
 // Batch import gathers many files into ONE scene, so it has to run inside a
 // single Blender session — separate processes would each start empty and the
@@ -484,11 +520,13 @@ nt.nodes.clear()
 bg = nt.nodes.new("ShaderNodeBackground")
 env_node = nt.nodes.new("ShaderNodeTexEnvironment")
 env_node.image = bpy.data.images.load(PARAMS["path"])
+if PARAMS.get("pack"): env_node.image.pack()
 out_node = nt.nodes.new("ShaderNodeOutputWorld")
 nt.links.new(env_node.outputs["Color"], bg.inputs["Color"])
 nt.links.new(bg.outputs["Background"], out_node.inputs["Surface"])
 result["world"] = w.name
-result["hdri_image"] = PARAMS["path"]`;
+result["hdri_image"] = PARAMS["path"]
+result["packed"] = bool(PARAMS.get("pack"))`;
 
 const TEXTURE_IMPORT_BODY = `mat = bpy.data.materials.new(PARAMS["material_name"])
 mat.use_nodes = True
@@ -503,6 +541,7 @@ added = []
 for map_name, path in PARAMS["maps"].items():
     tex = nt.nodes.new("ShaderNodeTexImage")
     tex.image = bpy.data.images.load(path)
+    if PARAMS.get("pack"): tex.image.pack()
     target, cs = ROUTE.get(map_name, (None, "Non-Color"))
     try: tex.image.colorspace_settings.name = cs
     except Exception: pass
@@ -515,7 +554,8 @@ for map_name, path in PARAMS["maps"].items():
             nt.links.new(tex.outputs["Color"], bsdf.inputs[target])
     added.append(map_name)
 result["material"] = mat.name
-result["maps_added"] = added`;
+result["maps_added"] = added
+result["packed"] = bool(PARAMS.get("pack"))`;
 
 // --safe gate: AST-validate agent code inside Blender, refuse on violations,
 // then exec in a CLEAN namespace (bpy/PARAMS/result only) so wrapper imports
@@ -530,9 +570,10 @@ try:
 except SyntaxError as e:
     violations.append("syntax error: %s" % e)
 BANNED_IMPORTS = {"os", "subprocess", "socket", "shutil", "sys", "ctypes", "urllib", "http"}
-BANNED_CALLS = {"eval", "exec", "__import__"}
+BANNED_CALLS = {"eval", "exec", "compile", "globals", "locals", "vars", "setattr", "delattr", "__import__"}
 BANNED_ATTRS = {"system", "popen", "spawnl", "spawnv", "spawnve", "fork", "execl", "execv", "execve", "execvp",
-    "startfile", "rmtree", "write_text", "write_bytes", "chmod", "symlink_to", "hardlink_to", "removedirs"}
+    "startfile", "rmtree", "write_text", "write_bytes", "chmod", "symlink_to", "hardlink_to", "removedirs",
+    "script_directories", "save_userpref", "__dict__", "__class__", "__subclasses__"}
 def _mode_is_write(call, mode_idx):
     for kw in call.keywords:
         if kw.arg == "mode" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
@@ -557,8 +598,12 @@ if tree is not None:
                 violations.append("open()/.open() call in write/append mode")
             if fname == "getattr" and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in BANNED_IMPORTS:
                 violations.append("getattr() escape via banned module: " + node.args[0].id)
+            if fname == "getattr" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant) and node.args[1].value in BANNED_ATTRS:
+                violations.append("getattr() access to blocked persistence/reflection surface: " + str(node.args[1].value))
             if fname in BANNED_ATTRS and isinstance(f, ast.Attribute):
                 violations.append("attribute access looks like a system/filesystem escape: ." + fname)
+        elif isinstance(node, ast.Attribute) and node.attr in BANNED_ATTRS:
+            violations.append("blocked persistence/reflection attribute: ." + node.attr)
 if violations:
     result["violations"] = sorted(set(violations))
     raise RuntimeError("sandbox: rejected %d violation(s)" % len(set(violations)))
@@ -612,7 +657,7 @@ const commands = {};
 // guess. Anything outside it reports `untested`, never `supported`: claiming
 // support for a major nobody exercised is how a tool tells a user everything is
 // fine right up until an operator it never called moved.
-const TESTED_VERSIONS = ['5.1'];
+const TESTED_VERSIONS = ['4.3', '5.2'];
 const MIN_VERSION = [3, 0];
 
 function supportVerdict(v) {
@@ -636,13 +681,23 @@ commands.doctor = async (args, ctx) => {
   const probe = runBlender(`result["bpy_version"] = list(bpy.app.version)
 result["build"] = bpy.app.version_string
 result["python"] = sys.version.split()[0]
-imp = dir(bpy.ops.wm); scn = dir(bpy.ops.import_scene)
+imp = dir(bpy.ops.wm); scn = dir(bpy.ops.import_scene); exp = dir(bpy.ops.export_scene)
+impm = dir(bpy.ops.import_mesh); expm = dir(bpy.ops.export_mesh)
 result["formats"] = {
     "gltf": "gltf" in scn, "fbx": "fbx" in scn,
     "obj": "obj_import" in imp or "obj" in scn,
     "stl": "stl_import" in imp or "stl" in dir(bpy.ops.import_mesh),
     "ply": "ply_import" in imp or "ply" in dir(bpy.ops.import_mesh),
     "usd": "usd_import" in imp, "alembic": "alembic_import" in imp, "collada": "collada_import" in imp}
+result["io"] = {
+    "gltf": {"import": "gltf" in scn, "export": "gltf" in exp},
+    "fbx": {"import": "fbx" in scn, "export": "fbx" in exp},
+    "obj": {"import": "obj_import" in imp or "obj" in scn, "export": "obj_export" in imp or "obj" in exp},
+    "stl": {"import": "stl_import" in imp or "stl" in impm, "export": "stl_export" in imp or "stl" in expm},
+    "ply": {"import": "ply_import" in imp or "ply" in impm, "export": "ply_export" in imp or "ply" in expm},
+    "usd": {"import": "usd_import" in imp, "export": "usd_export" in imp},
+    "alembic": {"import": "alembic_import" in imp, "export": "alembic_export" in imp},
+    "collada": {"import": "collada_import" in imp, "export": "collada_export" in imp}}
 result["video_ffmpeg"] = "FFMPEG" in [i.identifier for i in bpy.types.ImageFormatSettings.bl_rna.properties["file_format"].enum_items]
 result["engines"] = [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items]
 # Cycles denoises by default; a build without OpenImageDenoise fails the render
@@ -679,11 +734,14 @@ result["api"] = {
 result["addons_enabled"] = sorted(a.module for a in bpy.context.preferences.addons)`, { flags });
   const v = probe.ok ? probe.result.bpy_version : null;
   const verdict = supportVerdict(v);
+  const limitations = [];
+  if (probe.ok && probe.result?.io?.usd?.export === false) limitations.push('USD export operator unavailable in this Blender build');
+  if (probe.ok && probe.result?.video_ffmpeg === false) limitations.push('FFmpeg video output unavailable; use an image sequence');
   show({
     ok: probe.ok === true, blender_bin: bin, version: versionLine,
     platform: process.platform, headless_ok: probe.ok === true,
     support: verdict, tested_versions: TESTED_VERSIONS,
-    ...(probe.result || {}), error: probe.error || undefined,
+    ...(probe.result || {}), limitations, error: probe.error || undefined,
   }, ctx);
   if (!probe.ok) process.exit(1);
 };
@@ -796,6 +854,118 @@ result["lights"] = [o.name for o in sc.objects if o.type == "LIGHT"]`;
   const r = runBlender(body, { blend: flags.blend, flags });
   show(r, ctx);
   if (!r.ok) process.exit(1);
+};
+
+// `nodes find|inspect` — discover the node vocabulary exposed by this exact
+// Blender build, or inspect a bounded graph rather than dumping an entire file.
+const NODES_BODY = `import fnmatch
+mode = PARAMS["mode"]
+limit = int(PARAMS.get("limit") or 100)
+if mode == "find":
+    kind = str(PARAMS.get("kind") or "all").lower()
+    prefixes = {"geometry": ("GeometryNode",), "shader": ("ShaderNode",),
+        "compositor": ("CompositorNode",), "all": ("GeometryNode", "ShaderNode", "CompositorNode")}
+    if kind not in prefixes: raise RuntimeError("--kind must be geometry|shader|compositor|all")
+    query = str(PARAMS.get("search") or "*")
+    ql = query.lower()
+    items = []
+    for name in dir(bpy.types):
+        if not name.startswith(prefixes[kind]): continue
+        cls = getattr(bpy.types, name, None)
+        if cls is None: continue
+        ident = getattr(cls, "bl_idname", None) or name
+        label = getattr(cls, "bl_label", None) or name
+        if not (fnmatch.fnmatch(name.lower(), ql) or fnmatch.fnmatch(str(ident).lower(), ql) or
+                ql.strip("*") in name.lower() or ql.strip("*") in str(label).lower()): continue
+        items.append({"id": ident, "type": name, "label": label})
+    items.sort(key=lambda x: (x["label"].lower(), x["id"]))
+    result["nodes"] = items[:limit]
+    result["matched"] = len(items); result["returned"] = min(limit, len(items)); result["kind"] = kind
+else:
+    pattern = str(PARAMS.get("group") or "*")
+    trees = []; seen = set()
+    def add_tree(tree, owner):
+        if tree is None or tree.as_pointer() in seen: return
+        seen.add(tree.as_pointer()); trees.append((tree, owner))
+    for tree in bpy.data.node_groups: add_tree(tree, "node_group")
+    for mat in bpy.data.materials: add_tree(getattr(mat, "node_tree", None), "material:" + mat.name)
+    for world in bpy.data.worlds: add_tree(getattr(world, "node_tree", None), "world:" + world.name)
+    add_tree(getattr(bpy.context.scene, "node_tree", None), "scene")
+    groups = []
+    for tree, owner in trees:
+        if not (fnmatch.fnmatch(tree.name.lower(), pattern.lower()) or pattern.lower().strip("*") in tree.name.lower()): continue
+        ns = []
+        for n in list(tree.nodes)[:limit]:
+            ns.append({"name": n.name, "label": n.label or None, "id": n.bl_idname, "type": n.type,
+                "inputs": [s.name for s in n.inputs], "outputs": [s.name for s in n.outputs]})
+        links = [{"from": l.from_node.name, "from_socket": l.from_socket.name,
+                  "to": l.to_node.name, "to_socket": l.to_socket.name} for l in list(tree.links)[:limit * 4]]
+        groups.append({"name": tree.name, "tree_type": tree.bl_idname, "owner": owner,
+            "nodes": ns, "node_count": len(tree.nodes), "links": links, "link_count": len(tree.links),
+            "truncated": len(tree.nodes) > limit or len(tree.links) > limit * 4})
+    groups.sort(key=lambda x: x["name"].lower())
+    result["node_graphs"] = groups[:limit]
+    result["matched"] = len(groups); result["returned"] = min(limit, len(groups))`;
+
+commands.nodes = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'kind', 'search', 'group', 'limit', ...COMMON_FLAGS]);
+  const mode = positional[0] || 'find';
+  if (!['find', 'inspect'].includes(mode)) {
+    show({ ok: false, error: `unknown nodes subcommand: ${mode}`, usage: 'blender-cli nodes find [--kind geometry|shader|compositor|all] [--search pattern] [--limit N] | nodes inspect [--group pattern] [--blend f]' }, ctx); process.exit(1);
+  }
+  const limit = flags.limit === undefined ? 100 : Number(flags.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) { show({ ok: false, error: `invalid --limit: ${flags.limit} (integer 1..500)` }, ctx); process.exit(1); }
+  const r = runBlender(NODES_BODY, { blend: flags.blend, params: {
+    mode, kind: flags.kind || 'all', search: flags.search || '*', group: flags.group || '*', limit,
+  }, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// `camera` — emit calibration metadata for CV and synthetic-data pipelines.
+// Blender camera space is X right, Y up, -Z forward; OpenCV is X right, Y
+// down, Z forward, so the extrinsic matrix includes that explicit axis flip.
+const CAMERA_BODY = `from mathutils import Matrix, Vector
+from bpy_extras.object_utils import world_to_camera_view
+sc = bpy.context.scene
+name = PARAMS.get("name")
+o = bpy.data.objects.get(name) if name else sc.camera
+if o is None or o.type != "CAMERA": raise RuntimeError("camera not found: " + str(name or "active scene camera"))
+if o.data.type != "PERSP": raise RuntimeError("camera calibration currently requires a perspective camera (got " + o.data.type + ")")
+if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
+cam = o.data; scale = sc.render.resolution_percentage / 100.0
+rx = int(round(sc.render.resolution_x * scale)); ry = int(round(sc.render.resolution_y * scale))
+pax = float(sc.render.pixel_aspect_x); pay = float(sc.render.pixel_aspect_y); par = pay / pax
+fit = cam.sensor_fit
+if fit == "AUTO": fit = "HORIZONTAL" if pax * rx >= pay * ry else "VERTICAL"
+sensor = cam.sensor_height if fit == "VERTICAL" else cam.sensor_width
+view = par * ry if fit == "VERTICAL" else rx
+fx = cam.lens / sensor * view; fy = fx / par
+cx = (rx - 1) / 2.0 - cam.shift_x * view
+cy = (ry - 1) / 2.0 + cam.shift_y * view / par
+K = [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
+w2b = o.matrix_world.inverted()
+axis = Matrix(((1,0,0,0), (0,-1,0,0), (0,0,-1,0), (0,0,0,1)))
+w2cv = axis @ w2b
+def rows(m): return [[round(float(m[r][c]), 9) for c in range(4)] for r in range(4)]
+# Project a point on the optical axis through Blender itself. Pixel-centre
+# coordinates should land on the principal point, including sensor shift.
+probe_world = o.matrix_world @ Vector((0.0, 0.0, -10.0))
+ndc = world_to_camera_view(sc, o, probe_world)
+observed = [ndc.x * rx - 0.5, (1.0 - ndc.y) * ry - 0.5]
+result["camera"] = {"name": o.name, "frame": sc.frame_current, "resolution": [rx, ry],
+    "pixel_aspect": [pax, pay], "sensor_fit": fit, "sensor_mm": [cam.sensor_width, cam.sensor_height],
+    "lens_mm": cam.lens, "shift": [cam.shift_x, cam.shift_y],
+    "K": [[round(v, 9) for v in row] for row in K],
+    "blender_world_to_camera": rows(w2b), "opencv_world_to_camera": rows(w2cv),
+    "convention": {"image_origin": "top-left", "camera_axes": "OpenCV: +X right, +Y down, +Z forward", "distortion": "none"},
+    "principal_point_check": {"expected": [round(cx, 6), round(cy, 6)],
+        "observed": [round(v, 6) for v in observed],
+        "error_px": [round(observed[0] - cx, 6), round(observed[1] - cy, 6)]}}`;
+
+commands.camera = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'frame', ...COMMON_FLAGS]);
+  const r = runBlender(CAMERA_BODY, { blend: flags.blend, params: { name: positional[0] || null, frame: flags.frame ?? null }, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
 };
 
 // Shared render setup: engine / device / samples / resolution as bpy, from PARAMS.
@@ -918,7 +1088,7 @@ def _meta(result, sc):
 // PNG sequence. Result JSON carries engine/resolution/samples/duration/bytes so
 // the agent can verify the render without a second round-trip.
 commands.render = async (args, ctx) => {
-  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'frames', 'fps', 'samples', 'res', 'engine', 'device', 'denoise', 'threads', 'batch', 'ext', ...COMMON_FLAGS]);
+  const { flags } = fdn.parseArgs(args, ['blend', 'out', 'frame', 'frames', 'fps', 'samples', 'res', 'engine', 'device', 'denoise', 'threads', 'batch', 'ext', 'accept', 'receipt', ...COMMON_FLAGS]);
   const animation = !!flags.animation;
   const out = resolve(flags.out || join(process.cwd(), animation ? 'preview.mp4' : 'preview.png'));
   if (flags.threads !== undefined && !(Number.isInteger(Number(flags.threads)) && Number(flags.threads) > 0)) {
@@ -929,7 +1099,16 @@ commands.render = async (args, ctx) => {
     res: flags.res || null, engine: flags.engine || null, device: flags.device || null,
     samples: flags.samples ?? null, denoise: flags.denoise ?? null, threads: flags.threads ?? null,
   };
+  if (flags.accept !== undefined) {
+    if (flags.accept === true) { show({ ok: false, error: 'missing value for --accept (acceptance JSON path)' }, ctx); process.exit(1); }
+    const gate = runAcceptance(flags.accept, { blend: flags.blend, receipt: flags.receipt, flags });
+    if (!gate.ok) {
+      show({ ok: false, error: `render blocked: ${gate.error}`, acceptance: gate.result?.acceptance || null, receipt: gate.receipt || null }, ctx);
+      process.exit(1);
+    }
+  }
   const still = `${RENDER_SETUP}
+import hashlib as _hashlib
 if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
 if not any(o.type == "CAMERA" for o in sc.objects):
     raise RuntimeError("no camera in scene to render from")
@@ -949,9 +1128,15 @@ result["rendered"] = out
 result["frame"] = sc.frame_current
 result["duration_ms"] = int((time.time() - _t) * 1000)
 result["bytes"] = os.path.getsize(out)
+if result["bytes"] <= 0: raise RuntimeError("render reported success but produced an empty artifact: " + out)
+_h = _hashlib.sha256()
+with open(out, "rb") as _f:
+    for _chunk in iter(lambda: _f.read(1024 * 1024), b""): _h.update(_chunk)
+result["artifact"] = {"path": out, "kind": "image", "bytes": result["bytes"], "sha256": _h.hexdigest(), "format": fmt}
 _meta(result, sc)`;
   const anim = `${RENDER_SETUP}
 import glob as _glob
+import hashlib as _hashlib
 if not any(o.type == "CAMERA" for o in sc.objects):
     raise RuntimeError("no camera in scene to render from")
 out = PARAMS["out"]
@@ -974,6 +1159,12 @@ if video:
     os.replace(produced[0], out)
     result["rendered"] = out
     result["bytes"] = os.path.getsize(out)
+    if result["bytes"] <= 0: raise RuntimeError("render reported success but produced an empty video: " + out)
+    _h = _hashlib.sha256()
+    with open(out, "rb") as _f:
+        for _chunk in iter(lambda: _f.read(1024 * 1024), b""): _h.update(_chunk)
+    result["artifact"] = {"path": out, "kind": "video", "bytes": result["bytes"], "sha256": _h.hexdigest(),
+        "container": sc.render.ffmpeg.format, "codec": sc.render.ffmpeg.codec}
 else:
     prefix = out[:-4] + "_" if out.lower().endswith(".png") else os.path.join(out, "frame_")
     os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
@@ -988,6 +1179,14 @@ else:
     result["files"] = [files[0], files[-1]]
     result["frame_files"] = len(files)
     result["bytes"] = sum(os.path.getsize(f) for f in files)
+    if result["bytes"] <= 0: raise RuntimeError("render reported success but produced an empty frame sequence")
+    _h = _hashlib.sha256()
+    for _path in files:
+        _h.update(os.path.basename(_path).encode("utf-8")); _h.update(b"\\0")
+        with open(_path, "rb") as _f:
+            for _chunk in iter(lambda: _f.read(1024 * 1024), b""): _h.update(_chunk)
+    result["artifact"] = {"path": result["rendered"], "kind": "sequence", "bytes": result["bytes"],
+        "sha256": _h.hexdigest(), "files": len(files), "format": "PNG"}
 result["frames"] = [sc.frame_start, sc.frame_end]
 result["frame_count"] = sc.frame_end - sc.frame_start + 1
 result["fps"] = sc.render.fps
@@ -1028,7 +1227,7 @@ _meta(result, sc)`;
 // Haven asset by id (model -> imported, hdri -> world environment, texture ->
 // wired PBR material). Reports what arrived so the agent can verify.
 commands.import = async (args, ctx) => {
-  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'type', 'res', 'batch', ...COMMON_FLAGS]);
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'type', 'res', 'maps', 'batch', ...COMMON_FLAGS]);
   const src = positional[0];
   if (flags.batch) {
     const files = globFiles(String(flags.batch));
@@ -1048,15 +1247,21 @@ commands.import = async (args, ctx) => {
     const assetId = src.slice('polyhaven:'.length);
     const res = flags.res || '1k';
     let dl;
-    try { dl = await polyhavenDownload(assetId, { type: flags.type, res }); }
+    const maps = typeof flags.maps === 'string' ? flags.maps.split(',').map(x => x.trim()).filter(Boolean) : null;
+    if (flags.maps === true || (flags.maps !== undefined && !maps?.length)) {
+      show({ ok: false, error: 'missing value for --maps (comma-separated map names)' }, ctx); process.exit(1);
+    }
+    try { dl = await polyhavenDownload(assetId, { type: flags.type, res, maps }); }
     catch (e) {
       show({ ok: false, error: e.message, hint: 'check the asset id on https://polyhaven.com, --type hdri|texture|model, --res 1k|2k|4k' }, ctx);
       process.exit(1);
     }
-    const r = dl.kind === 'hdri' ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: dl.main }, flags })
-      : dl.kind === 'model' ? runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: dl.main }, flags })
-      : runBlender(TEXTURE_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { maps: dl.maps, material_name: assetId }, flags });
-    if (r.ok) r.result = { ...(r.result || {}), asset_id: assetId, asset_type: dl.kind, resolution: res, files: dl.files.length, cached: dl.cached };
+    const r = dl.kind === 'hdri' ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: dl.main, pack: !!flags.pack }, flags })
+      : dl.kind === 'model' ? runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: dl.main, pack: !!flags.pack }, flags })
+      : runBlender(TEXTURE_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { maps: dl.maps, material_name: assetId, pack: !!flags.pack }, flags });
+    if (r.ok) r.result = { ...(r.result || {}), asset_id: assetId, asset_type: dl.kind, resolution: res,
+      files: dl.files.length, cached: dl.cached, cache_dir: dl.cache_dir, provenance: dl.provenance,
+      selected_maps: maps, packed: !!flags.pack };
     show(r, ctx); if (!r.ok) process.exit(1);
     return;
   }
@@ -1066,8 +1271,8 @@ commands.import = async (args, ctx) => {
   }
   const localExt = src.toLowerCase().split('.').pop();
   const r = (flags.type === 'hdri' || ['hdr', 'exr'].includes(localExt))
-    ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: resolve(src) }, flags })
-    : runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: resolve(src) }, flags });
+    ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: resolve(src), pack: !!flags.pack }, flags })
+    : runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: resolve(src), pack: !!flags.pack }, flags });
   show(r, ctx); if (!r.ok) process.exit(1);
 };
 
@@ -1161,7 +1366,8 @@ commands.generate = async (args, ctx) => {
 // dimensions the target format actually carries, so STL is never accused of
 // losing materials it was never able to hold. --no-verify skips the readback,
 // --strict turns a degraded result into a non-zero exit.
-const EXPORT_BODY = `${FCURVES_HELPER}p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
+const EXPORT_BODY = `${FCURVES_HELPER}import hashlib as _hashlib
+p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
 sel = bool(PARAMS.get("selected"))
 anim = PARAMS.get("animations") is not False
 os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
@@ -1180,11 +1386,31 @@ def _census(objs):
     # motion and several exporters legitimately skip it.
     def _nkeys(o): return sum(len(fc.keyframe_points) for fc in _fcurves(o))
     animated = [o for o in objs if _nkeys(o) >= 2]
+    color_channels = []
+    color_nonconstant = 0
+    for o in meshes:
+        for a in (getattr(o.data, "color_attributes", []) or []):
+            components = []
+            for d in list(a.data)[:4096]:
+                v = getattr(d, "color", getattr(d, "vector", getattr(d, "value", None)))
+                if v is None: continue
+                values = [float(x) for x in v] if hasattr(v, "__len__") else [float(v)]
+                while len(components) < len(values): components.append([])
+                for i, value in enumerate(values): components[i].append(value)
+            ranges = [(max(values) - min(values)) if values else 0.0 for values in components]
+            span = max(ranges, default=0.0)
+            color_channels.append({"mesh": o.name, "name": a.name, "domain": a.domain, "data_type": a.data_type,
+                "samples": len(a.data), "range": round(span, 7), "component_ranges": [round(x, 7) for x in ranges]})
+            if span > 1e-6: color_nonconstant += 1
     return {"objects": len(objs), "meshes": len(meshes),
         "verts": sum(len(o.data.vertices) for o in meshes),
+        "faces": sum(len(o.data.polygons) for o in meshes),
+        "loops": sum(len(o.data.loops) for o in meshes),
         "materials": len(mats),
+        "material_slots": sum(len(o.data.materials) for o in meshes),
         "uv_layers": sum(len(o.data.uv_layers) for o in meshes),
         "color_attrs": sum(len(getattr(o.data, "color_attributes", []) or []) for o in meshes),
+        "color_nonconstant": color_nonconstant, "color_channels": color_channels,
         "shape_keys": sum(_nsk(o) for o in meshes),
         "animated": len(animated), "keyframes": sum(_nkeys(o) for o in animated)}
 
@@ -1205,13 +1431,13 @@ def _census(objs):
 # healthy round-trip while a vanished animation still shows as 1 -> 0. USD is
 # written with animation, but Blender's USD importer does not read it back as
 # keyframes, so USD is not judged on it (measured, not assumed).
-_ALL = ["meshes", "verts", "materials", "uv_layers", "color_attrs", "shape_keys", "animated"]
-_GEO_MAT = ["meshes", "verts", "materials", "uv_layers"]
+_ALL = ["meshes", "verts", "faces", "loops", "materials", "material_slots", "uv_layers", "color_attrs", "color_nonconstant", "shape_keys", "animated"]
+_GEO_MAT = ["meshes", "verts", "faces", "loops", "materials", "material_slots", "uv_layers"]
 CARRIES = {"glb": _ALL, "gltf": _ALL,
     "obj": _GEO_MAT,
-    "fbx": ["meshes", "verts", "materials", "uv_layers", "shape_keys", "animated"],
-    "stl": ["verts"],
-    "ply": ["verts", "color_attrs"],
+    "fbx": ["meshes", "verts", "faces", "loops", "materials", "material_slots", "uv_layers", "shape_keys", "animated"],
+    "stl": ["verts", "faces"],
+    "ply": ["verts", "faces", "color_attrs", "color_nonconstant"],
     "usd": _GEO_MAT, "usda": _GEO_MAT, "usdc": _GEO_MAT, "usdz": _GEO_MAT}
 
 _scene_objs = [o for o in bpy.context.scene.objects if not sel or o.select_get()]
@@ -1222,10 +1448,18 @@ elif ext == "obj": (bpy.ops.wm.obj_export(filepath=p, export_selected_objects=se
 elif ext == "fbx": bpy.ops.export_scene.fbx(filepath=p, use_selection=sel, bake_anim=anim)
 elif ext == "stl": (bpy.ops.wm.stl_export(filepath=p, export_selected_objects=sel) if "stl_export" in wm else bpy.ops.export_mesh.stl(filepath=p, use_selection=sel))
 elif ext == "ply": (bpy.ops.wm.ply_export(filepath=p, export_selected_objects=sel) if "ply_export" in wm else bpy.ops.export_mesh.ply(filepath=p, use_selection=sel))
-elif ext in ("usd", "usda", "usdc", "usdz"): bpy.ops.wm.usd_export(filepath=p, selected_objects_only=sel, export_animation=anim)
+elif ext in ("usd", "usda", "usdc", "usdz"):
+    if "usd_export" not in wm: raise RuntimeError("USD export is unavailable in this Blender build (doctor.io.usd.export=false)")
+    bpy.ops.wm.usd_export(filepath=p, selected_objects_only=sel, export_animation=anim)
 else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl ply usd usda usdc usdz)")
 
-result["exported"] = {"file": p, "format": ext, "bytes": os.path.getsize(p), "objects": len(_scene_objs),
+_bytes = os.path.getsize(p)
+if _bytes <= 0: raise RuntimeError("export reported success but produced an empty artifact: " + p)
+_h = _hashlib.sha256()
+with open(p, "rb") as _f:
+    for _chunk in iter(lambda: _f.read(1024 * 1024), b""): _h.update(_chunk)
+result["exported"] = {"file": p, "format": ext, "bytes": _bytes, "objects": len(_scene_objs),
+    "artifact": {"path": p, "kind": "model", "format": ext, "bytes": _bytes, "sha256": _h.hexdigest()},
     "animation": {"objects": before["animated"], "keyframes": before["keyframes"], "exported": anim}}
 
 if PARAMS.get("verify"):
@@ -1246,7 +1480,8 @@ if PARAMS.get("verify"):
         # More is fine (glTF splits verts at UV/normal seams); less is a loss.
         lost = [{"field": k, "scene": before[k], "file": after[k]} for k in fields if after[k] < before[k]]
         fid = {"checked": True, "ok": not lost, "compared": fields,
-            "scene": {k: before[k] for k in fields}, "file": {k: after[k] for k in fields}, "lost": lost}
+            "scene": {k: before[k] for k in fields}, "file": {k: after[k] for k in fields}, "lost": lost,
+            "detail": {"scene_color_channels": before["color_channels"], "file_color_channels": after["color_channels"]}}
     except Exception as e:
         fid = {"checked": False, "reason": "readback failed: %s" % e}
     result["exported"]["fidelity"] = fid`;
@@ -1596,6 +1831,115 @@ commands.snapshot = async (args, ctx) => {
     out, tmp, views: flags.views || null, res: flags.res || null, shading: flags.shading || null,
     frame: flags.frame ?? null, bg: flags.bg ?? null,
   }, flags });
+  show(r, ctx); if (!r.ok) process.exit(1);
+};
+
+// Declarative acceptance composes the existing scene verifier and optional
+// multi-view snapshot, then writes a receipt bound to the spec and .blend hash.
+const ACCEPT_ASSERTIONS = `spec = PARAMS["spec"]
+failures = []
+names = {o.name: o for o in bpy.context.scene.objects if not o.name.startswith("__bcli_")}
+for req in spec.get("required_objects", []):
+    if isinstance(req, str):
+        if req not in names: failures.append({"check": "required_object", "expected": req, "detail": "missing"})
+    elif isinstance(req, dict):
+        n = req.get("name"); o = names.get(n)
+        if o is None: failures.append({"check": "required_object", "expected": n, "detail": "missing"})
+        elif req.get("type") and o.type != str(req["type"]).upper():
+            failures.append({"check": "required_object_type", "object": n, "expected": str(req["type"]).upper(), "actual": o.type})
+for pat in spec.get("forbidden_objects", []):
+    import fnmatch as _fnmatch
+    hit = sorted(n for n in names if _fnmatch.fnmatch(n, str(pat)))
+    if hit: failures.append({"check": "forbidden_objects", "pattern": pat, "found": hit})
+for typ, minimum in spec.get("required_types", {}).items():
+    actual = sum(1 for o in names.values() if o.type == str(typ).upper())
+    if actual < int(minimum): failures.append({"check": "required_type", "type": str(typ).upper(), "expected_min": int(minimum), "actual": actual})
+if spec.get("min_objects") is not None and len(names) < int(spec["min_objects"]):
+    failures.append({"check": "min_objects", "expected": int(spec["min_objects"]), "actual": len(names)})
+if spec.get("frame_range") is not None:
+    expected = [int(x) for x in spec["frame_range"]]
+    actual = [bpy.context.scene.frame_start, bpy.context.scene.frame_end]
+    if actual != expected: failures.append({"check": "frame_range", "expected": expected, "actual": actual})
+max_errors = int(spec.get("max_errors", 0))
+if result["verified"]["errors"] > max_errors:
+    failures.append({"check": "verify_errors", "expected_max": max_errors, "actual": result["verified"]["errors"]})
+if spec.get("max_warnings") is not None and result["verified"]["warnings"] > int(spec["max_warnings"]):
+    failures.append({"check": "verify_warnings", "expected_max": int(spec["max_warnings"]), "actual": result["verified"]["warnings"]})
+snap_spec = spec.get("snapshot")
+if snap_spec:
+    minimum = float(snap_spec.get("min_coverage", 0.002)) if isinstance(snap_spec, dict) else 0.002
+    for view in result["snapshot"]["views"]:
+        if view["coverage"] < minimum:
+            failures.append({"check": "snapshot_coverage", "view": view["view"], "expected_min": minimum, "actual": view["coverage"]})
+result["acceptance"] = {"passed": not failures, "failures": failures, "objects": len(names),
+    "required_objects": len(spec.get("required_objects", [])), "spec_version": spec.get("version", 1)}`;
+
+function loadAcceptanceSpec(specPath) {
+  const path = resolve(specPath);
+  if (!existsSync(path)) throw new Error(`acceptance spec not found: ${path}`);
+  let spec;
+  try { spec = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { throw new Error(`invalid acceptance JSON: ${e.message}`); }
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) throw new Error('acceptance spec must be a JSON object');
+  if (spec.required_objects !== undefined && !Array.isArray(spec.required_objects)) throw new Error('required_objects must be a list');
+  if (spec.forbidden_objects !== undefined && !Array.isArray(spec.forbidden_objects)) throw new Error('forbidden_objects must be a list');
+  if (spec.required_types !== undefined && (!spec.required_types || typeof spec.required_types !== 'object' || Array.isArray(spec.required_types))) throw new Error('required_types must be an object');
+  if (spec.required_types !== undefined && Object.entries(spec.required_types).some(([, value]) => !Number.isInteger(Number(value)) || Number(value) < 0)) throw new Error('required_types values must be non-negative integers');
+  if (spec.frame_range !== undefined && (!Array.isArray(spec.frame_range) || spec.frame_range.length !== 2 || spec.frame_range.some(x => !Number.isInteger(Number(x))))) throw new Error('frame_range must be [start,end] integers');
+  for (const key of ['min_objects', 'max_errors', 'max_warnings']) {
+    if (spec[key] !== undefined && (!Number.isInteger(Number(spec[key])) || Number(spec[key]) < 0)) throw new Error(`${key} must be a non-negative integer`);
+  }
+  if (spec.mesh !== undefined && typeof spec.mesh !== 'boolean') throw new Error('mesh must be true or false');
+  if (spec.snapshot !== undefined && typeof spec.snapshot !== 'boolean' && (!spec.snapshot || typeof spec.snapshot !== 'object' || Array.isArray(spec.snapshot))) throw new Error('snapshot must be true, false, or an object');
+  if (spec.snapshot && typeof spec.snapshot === 'object') {
+    if (spec.snapshot.min_coverage !== undefined && (!Number.isFinite(Number(spec.snapshot.min_coverage)) || Number(spec.snapshot.min_coverage) < 0 || Number(spec.snapshot.min_coverage) > 1)) throw new Error('snapshot.min_coverage must be between 0 and 1');
+    if (spec.snapshot.res !== undefined && !/^\d+x\d+$/i.test(String(spec.snapshot.res))) throw new Error('snapshot.res must be WxH, for example 512x384');
+  }
+  return { path, spec };
+}
+
+function runAcceptance(specArg, { blend, receipt, flags }) {
+  if (!blend || typeof blend !== 'string') return { ok: false, error: '--blend is required so the receipt can bind to a source scene' };
+  if (!existsSync(blend)) return { ok: false, error: `blend file not found: ${resolve(blend)}` };
+  let loaded;
+  try { loaded = loadAcceptanceSpec(specArg); } catch (e) { return { ok: false, error: e.message }; }
+  const snapSpec = loaded.spec.snapshot;
+  const snap = snapSpec ? (typeof snapSpec === 'object' ? snapSpec : {}) : null;
+  const out = snap ? resolve(dirname(loaded.path), snap.out || `${basename(loaded.path).replace(/\.json$/i, '')}.snapshot.png`) : null;
+  const tmp = snap ? mkdtempSync(join(tmpdir(), 'blender-cli-accept-')) : null;
+  const params = {
+    spec: loaded.spec, tolerance: loaded.spec.tolerance ?? null, no_mesh: loaded.spec.mesh === false,
+    ...(snap ? { out, tmp, views: snap.views || null, res: snap.res || null, shading: snap.shading || null,
+      frame: snap.frame ?? null, bg: snap.bg ?? null } : {}),
+  };
+  const body = `${VERIFY_BODY}\n${snap ? SNAPSHOT_BODY : ''}\n${ACCEPT_ASSERTIONS}`;
+  const r = runBlender(body, { blend, params, flags });
+  if (r.ok && r.result?.acceptance && !r.result.acceptance.passed) {
+    r.ok = false; r.error = `acceptance failed: ${r.result.acceptance.failures.length} requirement(s) unmet`;
+  }
+  const receiptPath = resolve(receipt || `${loaded.path.replace(/\.json$/i, '')}.receipt.json`);
+  try {
+    const source = blend ? fileProof(blend) : null;
+    const snapshot = out && existsSync(out) ? fileProof(out) : null;
+    const value = {
+      schema_version: 1, tool: PKG.name, tool_version: PKG.version, created_at: new Date().toISOString(),
+      passed: r.ok === true, spec: fileProof(loaded.path), source, snapshot,
+      verified: r.result?.verified || null, acceptance: r.result?.acceptance || null,
+      error: r.error || null,
+    };
+    writeJsonAtomic(receiptPath, value);
+    r.receipt = receiptPath;
+    if (r.result?.acceptance) r.result.acceptance.receipt = receiptPath;
+  } catch (e) {
+    return { ok: false, error: `could not write acceptance receipt: ${e.message}`, result: r.result };
+  }
+  return r;
+}
+
+commands.accept = async (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args, ['blend', 'receipt', ...COMMON_FLAGS]);
+  const spec = positional[0];
+  if (!spec) { show({ ok: false, error: 'missing acceptance spec', usage: 'blender-cli accept <acceptance.json> --blend scene.blend [--receipt result.json]' }, ctx); process.exit(1); }
+  const r = runAcceptance(spec, { blend: flags.blend, receipt: flags.receipt, flags });
   show(r, ctx); if (!r.ok) process.exit(1);
 };
 
@@ -2014,12 +2358,21 @@ const COMMAND_SPECS = [
     summary: 'Same as exec, from a .py file.' },
   { name: 'scene', effects: ['read'], usage: 'blender-cli scene [--blend f]', flags: [BLEND_FLAGS[0]],
     summary: 'Dump objects (transforms, F-curve and keyframe counts), frame range, engine, resolution, materials, cameras and lights as JSON.' },
+  { name: 'nodes', effects: ['read'], usage: 'blender-cli nodes find [--kind geometry|shader|compositor|all] [--search pattern] [--limit N] | nodes inspect [--group pattern] [--blend f]',
+    flags: [BLEND_FLAGS[0], FL('kind', 'kind', 'node family to discover'), FL('search', 'pattern', 'wildcard or substring over node ids and labels'), FL('group', 'pattern', 'node-group name filter'), FL('limit', 'N', 'bounded result size (1..500)')],
+    summary: 'Discover node types from the running Blender or inspect bounded node/link graphs from a scene.' },
+  { name: 'camera', effects: ['read'], usage: 'blender-cli camera [name] [--blend f] [--frame N]',
+    flags: [BLEND_FLAGS[0], FL('frame', 'N', 'frame at which to evaluate an animated camera')],
+    summary: 'Report camera intrinsics K, Blender and OpenCV extrinsics, pixel/sensor metadata, coordinate convention and a principal-point reprojection check.' },
   { name: 'verify', effects: ['read'], usage: 'blender-cli verify [--blend f] [--tolerance 0.001] [--fail-on error|warn|none] [--no-mesh]',
     flags: [BLEND_FLAGS[0], FL('tolerance', 'units', 'overlap depth that counts'), FL('fail-on', 'tier', 'which finding tier makes exit 1 (default error)'), FL('no-mesh', null, 'skip the per-mesh bmesh pass')],
     summary: 'Lint the scene: missing camera, empty meshes, bad transforms, real overlaps, off-camera objects, plus mesh health (loose geometry, non-manifold, zero-area faces, winding, convex colliders, modifier order).' },
   { name: 'snapshot', effects: ['files'], usage: 'blender-cli snapshot [--blend f] --out sheet.png [--views front,right,top,persp] [--res 512x384] [--shading random|material|solid] [--frame N]',
     flags: [BLEND_FLAGS[0], FL('out', 'path', 'PNG contact sheet to write'), FL('views', 'list', 'front back right left top bottom persp'), FL('res', 'WxH', 'tile size'), FL('shading', 'mode', 'random | material | solid'), FL('frame', 'N', 'frame to snapshot'), FL('bg', '0..1', 'sheet background grey')],
     summary: 'Cheap multi-view Workbench capture tiled into one PNG, with per-view coverage, occupied bbox, luminance and a blank flag, so the build can be checked without a full render.' },
+  { name: 'accept', effects: ['read', 'files'], usage: 'blender-cli accept <acceptance.json> --blend scene.blend [--receipt result.json]',
+    flags: [BLEND_FLAGS[0], FL('receipt', 'path', 'atomic JSON receipt (default beside the spec)')],
+    summary: 'Apply declarative object/type/frame/verify/snapshot requirements and write a receipt bound to the spec, source scene and visual evidence hashes.' },
   { name: 'add', effects: ['scene'], usage: 'blender-cli add <kind> [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z] [--type T] [--energy N] [--color c] [--text T] [--blend f] [--save f] | add --json "[...]"',
     flags: [...BLEND_FLAGS, FL('json', 'list', 'batch of ops in one launch: [{"what":"cube","name":"A","at":[0,0,1]}]')],
     summary: 'Add a primitive (cube sphere icosphere plane cylinder cone torus monkey), camera, light, empty or text by name, in one Blender launch; returns the resulting objects.' },
@@ -2028,26 +2381,28 @@ const COMMAND_SPECS = [
     summary: 'Set a property and insert a keyframe on a named object (rotation in degrees); works on both legacy and slotted actions; returns per-object keyframe counts.' },
   { name: 'material', effects: ['scene'], usage: 'blender-cli material <object> [--name M] [--color r,g,b|#hex] [--roughness x] [--metallic x] [--alpha x] [--emission c] [--emission-strength x] [--blend f] [--save f]', flags: [...BLEND_FLAGS],
     summary: 'Create or update a Principled BSDF material and assign it to a named object, using the 4.0+ socket names with fallbacks.' },
-  { name: 'import', effects: ['scene', 'network'], usage: 'blender-cli import <file | polyhaven:id> [--blend f] [--save f] [--type hdri|texture|model] [--res 1k|2k|4k] | import --batch "assets/*.glb"',
-    flags: [...BLEND_FLAGS, FL('type', 'kind', 'Poly Haven asset kind'), FL('res', 'res', 'Poly Haven resolution'), FL('batch', 'glob', 'gather many files into one scene')],
-    summary: 'Import glb gltf obj fbx stl ply usd abc dae, or fetch + import a Poly Haven asset (network). Reports what arrived.' },
+  { name: 'import', effects: ['scene', 'network'], usage: 'blender-cli import <file | polyhaven:id> [--blend f] [--save f] [--type hdri|texture|model] [--res 1k|2k|4k] [--maps a,b] [--pack] | import --batch "assets/*.glb"',
+    flags: [...BLEND_FLAGS, FL('type', 'kind', 'Poly Haven asset kind'), FL('res', 'res', 'Poly Haven resolution'), FL('maps', 'a,b', 'download only matching texture maps'), FL('pack', null, 'pack downloaded images into the saved .blend'), FL('batch', 'glob', 'gather many files into one scene')],
+    summary: 'Import local assets or fetch Poly Haven assets with selective maps, packed persistence, cache details and provider/license provenance.' },
   { name: 'generate', effects: ['network', 'files', 'scene'], usage: 'blender-cli generate "<prompt>" | generate --image ref.png [--out f.glb] [--import] [--wait sec]',
     flags: [...BLEND_FLAGS, FL('out', 'path', 'GLB to write'), FL('import', null, 'import the result into the scene'), FL('wait', 'sec', 'polling budget'), FL('image', 'path', 'image-to-3D reference')],
     summary: 'Text- or image-to-3D via Meshy (needs MESHY_API_KEY); downloads the GLB, optionally imports it.' },
   { name: 'export', effects: ['files'], usage: 'blender-cli export <out.glb|gltf|obj|fbx|stl|ply|usd> [--blend f] [--selected] [--no-verify] [--strict] [--animations on|off] | export <dir> --batch "b/*.blend" --format glb',
     flags: [BLEND_FLAGS[0], FL('selected', null, 'selected objects only'), FL('no-verify', null, 'skip the readback census'), FL('strict', null, 'degraded fidelity is exit 1'), FL('animations', 'on|off', 'write animation (default on)'), FL('batch', 'glob', 'one export per .blend'), FL('format', 'ext', 'batch output format')],
-    summary: 'Write the scene out, read it back and report a fidelity census (meshes, verts, materials, UVs, colour attrs, shape keys, animated objects) compared only on what the format can carry.' },
+    summary: 'Write the scene out, hash it, read it back and report format-aware fidelity across geometry, material slots, UVs, colour-channel variance, shape keys and animation.' },
   { name: 'render', effects: ['files', 'process'], usage: 'blender-cli render [--blend f] --out p.png [--frame N] [--res WxH] [--engine E] [--device auto|cpu|cuda|optix|metal|hip|oneapi] [--threads N] [--samples N] [--denoise on|off] [--detach] | render --animation --out clip.mp4 [--frames 1..48] [--fps 24] | render --batch "shots/*.blend" --out dir/',
-    flags: [BLEND_FLAGS[0], FL('out', 'path', 'image, video or sequence target'), FL('animation', null, 'render the frame range'), FL('frames', 'a..b', 'frame range'), FL('frame', 'N', 'still frame'), FL('engine', 'name', 'cycles | eevee | workbench'), FL('device', 'name', 'auto picks the best GPU backend, else cpu'), FL('threads', 'N', 'fixed CPU thread count'), FL('samples', 'N', 'render samples'), FL('denoise', 'on|off', 'Cycles denoising'), FL('detach', null, 'background job; poll with job status'), FL('batch', 'glob', 'one render per .blend'), FL('ext', 'ext', 'batch output extension')],
-    summary: 'Render a still, a video/PNG sequence, or a batch; the result reports engine, device, samples, resolution, bytes and duration. --detach returns a job id at once.' },
+    flags: [BLEND_FLAGS[0], FL('out', 'path', 'image, video or sequence target'), FL('animation', null, 'render the frame range'), FL('frames', 'a..b', 'frame range'), FL('frame', 'N', 'still frame'), FL('engine', 'name', 'cycles | eevee | workbench'), FL('device', 'name', 'auto picks the best GPU backend, else cpu'), FL('threads', 'N', 'fixed CPU thread count'), FL('samples', 'N', 'render samples'), FL('denoise', 'on|off', 'Cycles denoising'), FL('accept', 'spec', 'block unless the acceptance spec passes'), FL('receipt', 'path', 'acceptance receipt path'), FL('detach', null, 'background job; poll with job status'), FL('batch', 'glob', 'one render per .blend'), FL('ext', 'ext', 'batch output extension')],
+    summary: 'Render a still, video or sequence with non-empty artifact proof, SHA-256, actual format/codec metadata, and an optional fail-closed acceptance gate.' },
   { name: 'job', effects: ['process'], usage: 'blender-cli job list | status <id> | wait <id> [--timeout sec] [--poll sec] | cancel <id>',
     flags: [FL('timeout', 'sec', 'wait: give up (job keeps running)'), FL('poll', 'sec', 'wait: poll interval')],
     summary: 'Inspect, wait for or cancel detached renders/execs; status reports frames done (and percent when the range is known) or the final result.' },
   { name: 'addon', effects: ['prefs', 'files'], usage: 'blender-cli addon list [--all] | enable <module> [--no-persist] | disable <module> | install <file.py|.zip> [--enable]',
     flags: [FL('all', null, 'list disabled modules too'), FL('no-persist', null, 'do not write user preferences'), FL('enable', null, 'install: enable after installing')],
     summary: 'List, enable, disable or install add-ons and extensions headless; enable persists to user preferences unless --no-persist.' },
-  { name: 'schema', effects: ['read'], usage: 'blender-cli schema [--skill] [--out file]', flags: [FL('skill', null, 'render a SKILL.md instead of JSON'), FL('out', 'path', 'write to a file')],
-    summary: 'This manifest: every command with its effects, flags and usage, as JSON or as a drop-in agent skill file.' },
+  { name: 'install', effects: ['files'], usage: 'blender-cli install codex|claude|all|doctor [--global]', flags: [FL('global', null, 'install under the user home instead of the current repository')],
+    summary: 'Idempotently install or verify the generated skill for Codex and Claude Code.' },
+  { name: 'schema', effects: ['read'], usage: 'blender-cli schema [--command a,b] [--effects read,files] [--skill] [--out file]', flags: [FL('command', 'a,b', 'include only named commands'), FL('effects', 'a,b', 'include commands with any requested effect'), FL('skill', null, 'render a SKILL.md instead of JSON'), FL('out', 'path', 'write to a file')],
+    summary: 'Machine-readable command manifest, optionally filtered to the commands/effects an agent needs, or rendered as a drop-in skill.' },
   { name: 'version', effects: ['read'], usage: 'blender-cli version', flags: [], summary: 'Print name and version.' },
 ];
 
@@ -2084,20 +2439,72 @@ Common flags on every Blender-running command: ${common}. Machine-readable versi
 `;
 }
 
-commands.schema = (args, ctx) => {
-  const { flags } = fdn.parseArgs(args, ['out']);
-  const manifest = {
+function buildManifest(specs = COMMAND_SPECS) {
+  return {
     name: PKG.name, version: PKG.version, description: PKG.description,
     contract: {
       output: 'one JSON object on stdout per invocation; -H pretty-prints',
       exit_code: '1 exactly when ok is false',
-      persistence: 'scene changes persist only with --save; render/export/snapshot write to the path given',
+      persistence: 'scene changes persist only with --save; render/export/snapshot/accept write to the path given',
       env: { BLENDER_BIN: 'Blender binary override', BLENDER_CLI_SAFE: '1 makes --safe the default', MESHY_API_KEY: 'text/image-to-3D backend' },
       common_flags: COMMON_SPEC_FLAGS,
     },
     effects_legend: EFFECTS,
-    commands: COMMAND_SPECS,
+    commands: specs,
   };
+}
+
+commands.install = (args, ctx) => {
+  const { flags, positional } = fdn.parseArgs(args);
+  const sub = positional[0] || 'all';
+  if (!['codex', 'claude', 'all', 'doctor'].includes(sub)) {
+    show({ ok: false, error: `unknown install target: ${sub}`, usage: 'blender-cli install codex|claude|all|doctor [--global]' }, ctx); process.exit(1);
+  }
+  const root = flags.global ? homedir() : process.cwd();
+  const targets = {
+    codex: join(root, flags.global ? '.codex' : '.agents', 'skills', 'blender-cli', 'SKILL.md'),
+    claude: join(root, '.claude', 'skills', 'blender-cli', 'SKILL.md'),
+  };
+  const names = sub === 'all' || sub === 'doctor' ? ['codex', 'claude'] : [sub];
+  const skill = renderSkill(buildManifest());
+  const items = names.map(name => {
+    const path = targets[name];
+    const exists = existsSync(path);
+    const current = exists ? readFileSync(path, 'utf8') : null;
+    if (sub === 'doctor') return { target: name, path, installed: exists, current: current === skill };
+    if (current === skill) return { target: name, path, installed: true, changed: false };
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, skill);
+      return { target: name, path, installed: true, changed: true };
+    } catch (e) {
+      return { target: name, path, installed: false, changed: false, error: e.message };
+    }
+  });
+  const ok = sub === 'doctor' ? items.every(i => i.installed && i.current) : items.every(i => i.installed);
+  show({ ok, scope: flags.global ? 'global' : 'repository', items,
+    ...(ok ? {} : { error: 'one or more agent skills are missing or stale', hint: `blender-cli install all${flags.global ? ' --global' : ''}` }) }, ctx);
+  if (!ok) process.exit(1);
+};
+
+commands.schema = (args, ctx) => {
+  const { flags } = fdn.parseArgs(args, ['out', 'command', 'effects']);
+  let specs = COMMAND_SPECS;
+  if (flags.command !== undefined) {
+    if (flags.command === true) { show({ ok: false, error: 'missing value for --command' }, ctx); process.exit(1); }
+    const names = String(flags.command).split(',').map(x => x.trim()).filter(Boolean);
+    const unknown = names.filter(n => !COMMAND_SPECS.some(c => c.name === n));
+    if (unknown.length) { show({ ok: false, error: `unknown command(s): ${unknown.join(', ')}` }, ctx); process.exit(1); }
+    specs = specs.filter(c => names.includes(c.name));
+  }
+  if (flags.effects !== undefined) {
+    if (flags.effects === true) { show({ ok: false, error: 'missing value for --effects' }, ctx); process.exit(1); }
+    const effects = String(flags.effects).split(',').map(x => x.trim()).filter(Boolean);
+    const unknown = effects.filter(e => !EFFECTS[e]);
+    if (unknown.length) { show({ ok: false, error: `unknown effect(s): ${unknown.join(', ')}` }, ctx); process.exit(1); }
+    specs = specs.filter(c => c.effects.some(e => effects.includes(e)));
+  }
+  const manifest = buildManifest(specs);
   if (flags.out === true) { show({ ok: false, error: 'missing value for --out' }, ctx); process.exit(1); }
   if (flags.skill) {
     const md = renderSkill(manifest);
@@ -2105,7 +2512,7 @@ commands.schema = (args, ctx) => {
     else process.stdout.write(md);
     return;
   }
-  if (flags.out) { writeFileSync(resolve(flags.out), JSON.stringify(manifest, null, 2) + '\n'); show({ ok: true, written: resolve(flags.out), commands: COMMAND_SPECS.length, format: 'json' }, ctx); return; }
+  if (flags.out) { writeFileSync(resolve(flags.out), JSON.stringify(manifest, null, 2) + '\n'); show({ ok: true, written: resolve(flags.out), commands: specs.length, format: 'json' }, ctx); return; }
   show(manifest, ctx);
 };
 
@@ -2122,6 +2529,9 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
   exec "<bpy>"  [--blend f] [--save f] [--check] [--safe] [--detach]   run agent-authored bpy; result[...] keys -> JSON back
   run <script.py> [--blend f] [--save f] [--check] [--safe] [--detach] same, from a .py file
   scene [--blend f]            dump objects / frame range / engine / materials / keyframes as JSON
+  nodes find [--kind geometry|shader|compositor|all] [--search pattern] [--limit N]
+  nodes inspect [--group pattern] [--blend f]        discover types or inspect a bounded node graph
+  camera [name] [--blend f] [--frame N]              K matrix + Blender/OpenCV extrinsics and reprojection check
   verify [--blend f] [--tolerance 0.001] [--fail-on error|warn|none] [--no-mesh]
                                lint the scene before you spend a render on it: missing camera,
                                empty meshes, NaN/degenerate transforms, unapplied non-uniform
@@ -2132,6 +2542,8 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
   snapshot [--blend f] --out sheet.png [--views front,right,top,persp] [--res 512x384] [--shading random|material|solid]
                                cheap Workbench contact sheet + per-view coverage/bbox/luminance
                                stats, so the agent can see what it built without a real render
+  accept <acceptance.json> --blend f [--receipt result.json]
+                               declarative scene/verify/snapshot requirements + hash-bound receipt
   add cube|sphere|icosphere|plane|cylinder|cone|torus|monkey|camera|light|empty|text
       [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z]
       [--type sun|point|spot|area] [--energy N] [--color r,g,b] [--text "..."] [--blend f] [--save f]
@@ -2142,8 +2554,8 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
   material <object> [--name M] [--color r,g,b|#hex] [--roughness x] [--metallic x] [--alpha x]
       [--emission r,g,b] [--emission-strength x] [--blend f] [--save f]
   import <file> [--blend f] [--save f]   pull an asset in: glb gltf obj fbx stl ply usd abc dae
-  import polyhaven:<id> [--type hdri|texture|model] [--res 1k|2k|4k]   fetch + import a Poly Haven asset
-         (model -> objects, hdri -> world environment, texture -> wired PBR material; cached in ~/.cache)
+  import polyhaven:<id> [--type hdri|texture|model] [--res 1k|2k|4k] [--maps a,b] [--pack]
+         fetch + import with provenance; select maps and optionally pack images into the .blend
   import --batch "assets/*.glb" [--save f]   gather many files into ONE scene
   generate "<prompt>" [--out f.glb] [--import] [--wait sec]  text-to-3D via Meshy (needs MESHY_API_KEY)
   generate --image ref.png [--out f.glb] [--import]          image-to-3D from a reference photo
@@ -2155,7 +2567,7 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
   export <out-dir> --batch "blends/*.blend" --format glb     one export per .blend
   render [--blend f] --out preview.png [--frame N] [--res 1280x720]
          [--engine cycles|eevee|workbench] [--device auto|cpu|cuda|optix|metal|hip|oneapi]
-         [--threads N] [--samples N] [--denoise on|off] [--detach]
+         [--threads N] [--samples N] [--denoise on|off] [--accept spec.json] [--receipt f] [--detach]
   render --animation --out clip.mp4 [--frames 1..48] [--fps 24] [...]  render the frame range
          (MP4/MOV/WEBM via Blender's ffmpeg, or a PNG sequence for any other --out)
   render --batch "shots/*.blend" --out renders/ [--ext png]  one render per .blend
@@ -2164,7 +2576,9 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
                                then the final result once Blender is finished
   addon list [--all] | enable <module> [--no-persist] | disable <module> | install <file.py|.zip> [--enable]
                                add-ons and extensions, headless; enable persists to user prefs
-  schema [--skill] [--out f]   the whole command surface as JSON with effects annotations,
+  install codex|claude|all|doctor [--global]  idempotently install or verify generated agent skills
+  schema [--command a,b] [--effects read,files] [--skill] [--out f]
+                               the command surface as JSON with effects annotations,
                                or as a drop-in SKILL.md for your agent
   version                      print name + version
 
