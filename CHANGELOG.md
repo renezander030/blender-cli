@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 (2026-09-19)
+
+Nine additions make Blender automation easier to discover, gate, verify and hand to downstream tools. The suite now has 81 end-to-end checks and passes on Blender 4.3.2 and 5.2.0 LTS.
+
+### Added
+
+- **Version and capability conformance.** `doctor` reports import and export support separately for every interchange format, lists actionable build limitations, and the tested matrix now covers Blender 4.3 and 5.2. Unsupported operators such as USD export fail with a capability-specific error.
+- **Deep interchange fidelity.** Export readback now compares faces, loops, material slots and non-constant colour-channel data in addition to the existing geometry, material, UV, shape-key and animation census. Colour-channel samples are included in the diagnostic detail.
+- **Artifact proofs.** Rendered images, videos, sequences and exported models must exist and be non-empty. Results include SHA-256, byte size and actual format; videos include the container and codec, and sequences use a stable aggregate hash.
+- `nodes find [--kind ...] [--search ...] [--limit N]` discovers the node types available in the running Blender. `nodes inspect [--group ...] [--blend f]` returns bounded node/socket/link graphs from node groups, materials, worlds and the compositor.
+- `accept <spec.json> --blend scene.blend [--receipt result.json]` applies declarative object, type, frame-range, scene-health and snapshot-coverage requirements. The atomic receipt binds the result to the spec, source `.blend` and optional visual proof hashes. `render --accept spec.json` blocks before rendering when acceptance fails.
+- **Safe-mode hardening.** The AST gate blocks Blender's live `script_directories` persistence surface, preference saving, reflection attributes and dynamic reflection builtins, including constant-name `getattr` access.
+- **Persistent, attributable assets.** Poly Haven results include provider URL, CC0 license and cache location. `--maps a,b` limits texture downloads and `--pack` embeds downloaded images into the saved `.blend`.
+- `install codex|claude|all|doctor [--global]` idempotently installs or verifies the generated agent skill. `schema --command a,b --effects read,files` emits only the requested command surface.
+- `camera [name] [--blend f] [--frame N]` reports a pixel-aspect and sensor-shift aware intrinsic matrix, Blender and OpenCV world-to-camera matrices, coordinate conventions, and a principal-point reprojection check.
+
+### Changed
+
+- `render`, animation renders and `export` return a common `artifact` proof block.
+- The machine-readable command schema and generated skill cover the four new commands and all new flags.
+
 ## 0.4.0 (2026-09-10)
 
 Nine additions. Theme: **build, look and ship without writing bpy, and without outliving your own tool-call limit.** The suite grew from 35 to 71 checks, run green on Blender 5.1.1.

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/blender-cli"><img src="https://img.shields.io/npm/v/blender-cli.svg" alt="npm version"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/node/v/blender-cli.svg" alt="node"></a>
-  <img src="https://img.shields.io/badge/Blender-3.0%2B%20(tested%20on%205.1)-0d9488" alt="Blender 3.0+, tested on 5.1">
+  <img src="https://img.shields.io/badge/Blender-3.0%2B%20(tested%204.3%20%2B%205.2%20LTS)-0d9488" alt="Blender 3.0+, tested on 4.3 and 5.2 LTS">
   <img src="https://img.shields.io/badge/dependencies-zero-0d9488" alt="zero dependencies">
   <a href="./LICENSE"><img src="https://img.shields.io/npm/l/blender-cli.svg" alt="license"></a>
 </p>
@@ -15,6 +15,20 @@
 ```bash
 npm install -g blender-cli && blender-cli doctor
 ```
+
+## New in v0.5.0
+
+Nine additions make an automated Blender run discoverable before execution and provable afterward:
+
+- **Two-version conformance.** The 81-check suite passes on Blender 4.3.2 and 5.2.0 LTS. `doctor` now reports import and export capabilities separately and names build-specific limitations; unavailable operators fail with the matching capability path.
+- **Deep export fidelity.** Readback covers faces, loops, material slots and colour-channel variance as well as geometry, materials, UVs, shape keys and animation, catching channels that survive by name but collapse to a flat value.
+- **Artifact proof.** Every render and export verifies a non-empty output and returns its SHA-256. Video results include the actual container/codec; image sequences use a stable aggregate hash.
+- **`nodes find|inspect`.** Discover the node types exposed by the running Blender, or inspect a wildcard-filtered, size-bounded graph of nodes, sockets and links from a `.blend`.
+- **`accept`.** A JSON spec can require objects/types, frame range, clean verification and minimum snapshot coverage. The result is an atomic receipt bound to the spec, source `.blend` and visual-proof hashes. `render --accept spec.json` refuses the expensive render when the gate fails.
+- **Hardened `--safe`.** Blender script-directory persistence, preference saving and reflection escapes are blocked by the AST gate.
+- **Attributable, persistent assets.** Poly Haven imports report provider URL, CC0 license and cache location; `--maps` limits texture downloads and `--pack` embeds downloaded images in the saved scene.
+- **One-command agent setup.** `install codex|claude|all|doctor` writes or checks the generated skill idempotently. `schema --command ... --effects ...` keeps agent context scoped to the commands it needs.
+- **`camera`.** Camera calibration JSON includes a sensor-shift and pixel-aspect aware K matrix, Blender/OpenCV extrinsics, coordinate conventions and a principal-point reprojection check.
 
 ## New in v0.4.0
 
@@ -90,6 +104,31 @@ blender-cli render --animation --blend demo.blend --out bounce.mp4 --frames 1..2
 blender-cli export demo.glb --blend demo.blend
 ```
 
+Gate a deliverable with a declarative acceptance spec and keep a hash-bound receipt:
+
+```json
+{
+  "version": 1,
+  "required_objects": [{ "name": "Camera", "type": "CAMERA" }, "Cube"],
+  "forbidden_objects": ["__draft_*"],
+  "required_types": { "MESH": 1 },
+  "frame_range": [1, 24],
+  "max_errors": 0,
+  "max_warnings": 2,
+  "snapshot": {
+    "out": "proof.png",
+    "views": "front,right,top,persp",
+    "res": "256x192",
+    "min_coverage": 0.01
+  }
+}
+```
+
+```bash
+blender-cli accept acceptance.json --blend demo.blend --receipt acceptance.receipt.json
+blender-cli render --blend demo.blend --out final.png --accept acceptance.json
+```
+
 Or build the same thing without writing any bpy, look at it, and hand a long render off to a job:
 
 ```bash
@@ -120,24 +159,29 @@ One JSON object on stdout per invocation; exit code 1 exactly when `ok` is false
 | `exec "<bpy>" [--blend f] [--save f] [--check] [--safe] [--detach]` | Run agent-authored `bpy`; set keys on `result` and they come back as JSON. `--check` compiles, flags risky calls and reports version-specific `api_drift` without executing; `--safe` refuses code that trips the AST gate; `--detach` runs it as a job. A failed exec on a known API move carries the hint. |
 | `run <script.py> [--blend f] [--save f] [--check] [--safe] [--detach]` | Same, from a `.py` file. |
 | `scene [--blend f]` | Dump objects (transforms, `fcurves`, `keyframes`, keyed `frames`), frame range, engine, resolution, materials, cameras and lights as JSON. |
+| `nodes find [--kind geometry\|shader\|compositor\|all] [--search pattern] [--limit N]` | Discover the node vocabulary available in the running Blender, bounded for agent context. |
+| `nodes inspect [--group pattern] [--blend f] [--limit N]` | Inspect filtered node groups, sockets and dependency links without dumping the whole file. |
+| `camera [name] [--blend f] [--frame N]` | Report camera K, Blender/OpenCV extrinsics, sensor/pixel metadata, coordinate convention and a principal-point reprojection check. |
 | `verify [--blend f] [--tolerance 0.001] [--fail-on error\|warn\|none] [--no-mesh]` | Lint the scene: missing camera, empty meshes, NaN/degenerate transforms, unapplied non-uniform scale, off-camera objects, real overlaps, plus per-mesh health: loose geometry, non-manifold edges, zero-area faces, inconsistent/inverted normals, non-convex `UCX_` colliders, Multires-not-last and Mirror-after-Subsurf stacks. Tiered error/warn/info; touching is not overlapping. |
 | `snapshot [--blend f] --out sheet.png [--views front,right,top,persp] [--res 512x384] [--shading random\|material\|solid] [--frame N]` | Workbench contact sheet in one launch, with per-view coverage, occupied bbox, luminance and a `blank` flag. Views: `front back right left top bottom persp`. |
+| `accept <spec.json> --blend f [--receipt result.json]` | Apply declarative scene, verification and visual-coverage requirements; write a receipt bound to the spec, source and snapshot hashes. |
 | `add <kind> [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z] [--type T] [--energy N] [--color c] [--text T]` | Add `cube sphere icosphere plane cylinder cone torus monkey camera light empty text` by name. `add --json '[...]'` runs a batch in one launch. Returns the objects as built. |
 | `keyframe <object> --frame N [--prop location\|rotation\|scale\|<data.path>] [--value x,y,z] [--interp linear\|bezier\|constant] [--no-extend]` | Set a property and key it (rotation in degrees; dotted paths like `data.energy` work); the frame range grows to the keyed frame unless `--no-extend`. `keyframe --json '[...]'` batches. Reads both legacy and slotted actions. |
 | `material <object> [--name M] [--color r,g,b\|#hex] [--roughness x] [--metallic x] [--alpha x] [--emission c] [--emission-strength x]` | Create or update a Principled BSDF material (4.0+ socket names, with fallbacks) and assign it. |
 | `import <file> [--blend f] [--save f]` | Pull an asset in: `glb gltf obj fbx stl ply usd usda usdc usdz abc dae`; a local `.hdr`/`.exr` becomes the world environment. Reports what arrived (objects, types, vert count). |
-| `import polyhaven:<id> [--type hdri\|texture\|model] [--res 1k\|2k\|4k]` | Fetch + import a [Poly Haven](https://polyhaven.com) asset: model → objects, HDRI → world environment, texture → wired PBR material. Cached in `~/.cache/blender-cli`. |
+| `import polyhaven:<id> [--type hdri\|texture\|model] [--res 1k\|2k\|4k] [--maps a,b] [--pack]` | Fetch + import a [Poly Haven](https://polyhaven.com) asset with provider/license/cache provenance; optionally select texture maps and pack images into the `.blend`. |
 | `import --batch "assets/*.glb" [--save f]` | Gather many files into ONE scene; per-file results, failures do not stop the rest. |
 | `generate "<prompt>" [--out f.glb] [--import] [--wait sec]` | Text-to-3D via [Meshy](https://www.meshy.ai) (`MESHY_API_KEY` required): submit, poll, download the GLB, optionally chain into the scene. |
 | `generate --image ref.png [--out f.glb] [--import]` | Image-to-3D from a reference photo (`png jpg webp`); a prompt given alongside becomes the texture prompt. |
-| `export <out> [--blend f] [--selected] [--no-verify] [--strict] [--animations on\|off]` | Hand the scene on: `glb gltf obj fbx stl ply usd`. Reads the file back and reports a `fidelity` census (meshes, verts, materials, UV layers, colour attrs, shape keys, animated objects), scoped to what the format can carry. |
+| `export <out> [--blend f] [--selected] [--no-verify] [--strict] [--animations on\|off]` | Hand the scene on: `glb gltf obj fbx stl ply usd`. Returns an artifact hash and reads the file back for format-aware geometry, material, UV, colour-variance, shape-key and animation fidelity. |
 | `export <out-dir> --batch "blends/*.blend" --format glb` | One export per `.blend`, named after its source. |
-| `render [--blend f] --out p.png [--frame N] [--res WxH] [--engine E] [--device auto\|cpu\|cuda\|optix\|metal\|hip\|oneapi] [--threads N] [--samples N] [--denoise on\|off] [--detach]` | Single-frame preview with a verifiable result: engine, device, threads, resolution, samples, duration, bytes. `--device auto` takes the best GPU backend available, else CPU. |
+| `render [--blend f] --out p.png [--frame N] [--res WxH] [--engine E] [--device auto\|cpu\|cuda\|optix\|metal\|hip\|oneapi] [--threads N] [--samples N] [--denoise on\|off] [--accept spec.json] [--detach]` | Render with engine/device metadata and a non-empty SHA-256 artifact proof. `--accept` runs the declarative gate first and blocks on failure. |
 | `render --animation --out clip.mp4 [--frames 1..48] [--fps 24] [--detach] [...]` | Render the frame range: MP4/MOV/WEBM via Blender's ffmpeg, or a PNG sequence for any other `--out`. `--detach` returns a job id immediately. |
 | `render --batch "shots/*.blend" --out renders/ [--ext png]` | One render per `.blend`; `--out` is a directory. |
 | `job list \| status <id> \| wait <id> [--timeout sec] [--poll sec] \| cancel <id>` | The other half of `--detach`: frames done (and percent when the range is known) while it runs, the final result once Blender is finished. Jobs live in `~/.cache/blender-cli/jobs` (`BLENDER_CLI_JOBS_DIR` overrides). |
 | `addon list [--all] \| enable <module> [--no-persist] \| disable <module> \| install <file.py\|.zip> [--enable]` | Add-ons and extensions without a UI. `enable` persists to user preferences (the point of it); `--no-persist` tries it for the one call. `install` takes a legacy add-on or an extension package (`blender_manifest.toml`, 4.2+). |
-| `schema [--skill] [--out file]` | The command surface as JSON with effects annotations (`read scene files code network prefs process`), or as a drop-in SKILL.md. |
+| `install codex\|claude\|all\|doctor [--global]` | Idempotently install or verify the generated Blender CLI skill for agent clients. |
+| `schema [--command a,b] [--effects read,files] [--skill] [--out file]` | The full or scoped command surface as JSON with effects annotations, or as a drop-in SKILL.md. |
 | `version` | Print name and version. |
 
 Batch patterns must be quoted so the shell does not expand them first; `*` and `?` work in the last path segment, `**` does not.
@@ -148,12 +192,11 @@ Batch patterns must be quoted so the shell does not expand them first; `*` and `
 
 | Version | Status |
 |---|---|
-| 5.1.1 | tested — `node test/smoke.mjs` green (71/71) |
-| 4.3.2, 5.2.0 LTS | tested at 0.3.0 (35/35); not yet re-run on this release's suite. They join `tested_versions` again the moment `node test/smoke.mjs --blender <path>` passes there. |
+| 4.3.2, 5.2.0 LTS | tested — the v0.5.0 suite passes 81/81 on both builds. |
 | 3.0 – 5.x, otherwise | untested; engines and import/export operators are resolved from the running build, so it may well work. [Report breakage.](https://github.com/renezander030/blender-cli/issues) |
 | below 3.0 | unsupported |
 
-Known Blender-side limit on 5.1.1: its own FBX *importer* fails on scenes that contain lights, so an `export` to FBX of a lit scene reports `fidelity.checked: false` with the reason, rather than a verdict.
+`doctor.io` reports import and export support separately because distro builds can omit an operator. For example, the tested 4.3.2 package has no USD importer/exporter; requesting USD export fails clearly with `doctor.io.usd.export=false` instead of crashing inside `bpy`.
 
 ## How it works
 
@@ -179,7 +222,7 @@ node test/smoke.mjs                          # against whatever `blender` resolv
 node test/smoke.mjs --blender /path/to/blender
 ```
 
-71 end-to-end checks against a real Blender — no mocking of the boundary, because the boundary (operator names, engine identifiers, exporter behaviour) is exactly what drifts between versions. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache.
+81 end-to-end checks against a real Blender — no mocking of the boundary, because the boundary (operator names, engine identifiers, exporter behaviour) is exactly what drifts between versions. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache.
 
 ## License
 

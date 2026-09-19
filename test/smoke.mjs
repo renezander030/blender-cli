@@ -11,7 +11,7 @@
 // matrix in the CLI: a version is only listed there once this suite passes on it.
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -81,6 +81,15 @@ check('doctor reports a working headless bpy', () => {
   return true;
 });
 
+check('doctor reports import/export capabilities and current limitations', () => {
+  const r = cli(['doctor']);
+  if (!r.json?.ok) return r.json?.error || 'doctor not ok';
+  if (typeof r.json.io?.gltf?.import !== 'boolean' || typeof r.json.io?.gltf?.export !== 'boolean') return 'no separate glTF import/export capability';
+  if (!Array.isArray(r.json.limitations)) return 'limitations is not a list';
+  if (r.json.io?.usd?.export === false && !r.json.limitations.some(x => /USD export/.test(x))) return 'missing USD exporter limitation';
+  return true;
+});
+
 check('support verdict never claims support for an untested version', () => {
   const r = cli(['doctor']);
   const { support, tested_versions } = r.json || {};
@@ -122,6 +131,18 @@ check('exec --safe refuses a banned import (exit 1)', () => {
   const r = cli(['exec', 'import os\nos.system("echo pwned")', '--safe']);
   if (r.code === 0) return 'exited 0 on banned import';
   return r.json?.result?.violations?.length ? true : 'no violations reported';
+});
+
+check('exec --safe blocks Blender script-directory persistence and reflection escapes', () => {
+  for (const code of [
+    'bpy.context.preferences.filepaths.script_directories.new(name="persist")',
+    'getattr(bpy.context.preferences.filepaths, "script_directories")',
+    'vars(bpy.context.preferences)',
+  ]) {
+    const r = cli(['exec', code, '--safe']);
+    if (r.code === 0 || !r.json?.result?.violations?.length) return `accepted: ${code}`;
+  }
+  return true;
 });
 
 check('scene dumps objects, engine and frame range', () => {
@@ -173,7 +194,8 @@ check('render reports resolution and byte size metadata', () => {
   const m = r.json?.result;
   if (!m) return 'no result';
   if (JSON.stringify(m.resolution) !== JSON.stringify([96, 72])) return `resolution ${JSON.stringify(m.resolution)} != [96,72]`;
-  return m.bytes > 0 ? true : 'no byte size';
+  if (!(m.bytes > 0)) return 'no byte size';
+  return /^[0-9a-f]{64}$/.test(m.artifact?.sha256 || '') ? true : `no artifact hash: ${JSON.stringify(m.artifact)}`;
 });
 
 check('render --animation writes a PNG sequence', () => {
@@ -193,6 +215,8 @@ check('export glb reports a passing fidelity census', () => {
   if (!f?.checked) return `fidelity not checked: ${f?.reason || 'no fidelity block'}`;
   if (!f.ok) return `fidelity degraded: ${JSON.stringify(f.lost)}`;
   if (!f.compared?.includes('verts')) return 'verts not compared';
+  if (!f.compared?.includes('faces') || !f.compared?.includes('loops')) return `deep geometry fields missing: ${f.compared}`;
+  if (!/^[0-9a-f]{64}$/.test(r.json.result.exported.artifact?.sha256 || '')) return 'no export artifact hash';
   return true;
 });
 
@@ -562,6 +586,11 @@ check('export fbx carries animation through the census', () => {
 });
 
 check('export usd is not judged on animation it cannot read back', () => {
+  const doctor = cli(['doctor']).json;
+  if (doctor?.io?.usd?.export === false) {
+    const unavailable = cli(['export', join(WORK, 'anim.usd'), '--blend', ANIM_NOLIGHT]);
+    return unavailable.code !== 0 && /doctor\.io\.usd\.export=false/.test(unavailable.json?.error || '') ? true : `unclear unsupported result: ${unavailable.json?.error}`;
+  }
   const r = cli(['export', join(WORK, 'anim.usd'), '--blend', ANIM_NOLIGHT]);
   if (!r.json?.ok) return r.json?.error || 'not ok';
   const fid = r.json.result.exported.fidelity;
@@ -681,8 +710,96 @@ check('addon disable turns it off; list --all still shows it installed', () => {
   return it && it.enabled === false ? true : `after disable: ${JSON.stringify(it)}`;
 });
 
+// --- 0.5.0: node discovery + bounded graph inspection -----------------------
+check('nodes find discovers version-specific Geometry Node types', () => {
+  const r = cli(['nodes', 'find', '--kind', 'geometry', '--search', '*position*', '--limit', '20']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  return r.json.result?.nodes?.some(n => n.id === 'GeometryNodeInputPosition') ? true : `nodes ${JSON.stringify(r.json.result?.nodes)}`;
+});
+
+const NODES_BLEND = join(WORK, 'nodes.blend');
+check('nodes inspect returns a filtered dependency graph', () => {
+  const setup = cli(['exec', 'g=bpy.data.node_groups.new("AgentGeo", "GeometryNodeTree")\ng.use_fake_user=True\na=g.nodes.new("GeometryNodeInputPosition")\nb=g.nodes.new("GeometryNodeSetPosition")\ng.links.new(a.outputs["Position"], b.inputs["Position"])', '--save', NODES_BLEND]);
+  if (!setup.json?.ok) return setup.json?.error || 'setup failed';
+  const r = cli(['nodes', 'inspect', '--blend', NODES_BLEND, '--group', 'AgentGeo', '--limit', '10']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const g = r.json.result?.node_graphs?.[0];
+  return g?.node_count === 2 && g?.link_count === 1 && g.truncated === false ? true : `graph ${JSON.stringify(g)}`;
+});
+
+// --- 0.5.0: camera calibration ----------------------------------------------
+const CAMERA_BLEND = join(WORK, 'camera.blend');
+check('camera reports shifted, pixel-aspect-aware intrinsics and OpenCV extrinsics', () => {
+  const setup = cli(['exec', 'c=bpy.context.scene.camera.data\nc.shift_x=0.1\nc.shift_y=0.2\nbpy.context.scene.render.pixel_aspect_x=1\nbpy.context.scene.render.pixel_aspect_y=2', '--blend', BLEND, '--save', CAMERA_BLEND]);
+  if (!setup.json?.ok) return setup.json?.error || 'setup failed';
+  const r = cli(['camera', '--blend', CAMERA_BLEND]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const c = r.json.result?.camera;
+  if (!Array.isArray(c?.K) || !Array.isArray(c?.opencv_world_to_camera)) return `missing matrices: ${JSON.stringify(c)}`;
+  if (c.K[0][0] === c.K[1][1]) return 'pixel aspect did not change fx/fy';
+  return c.principal_point_check.error_px.every(v => Math.abs(v) < 0.01) ? true : `reprojection error ${c.principal_point_check.error_px}`;
+});
+
+// --- 0.5.0: deep colour fidelity --------------------------------------------
+check('strict glTF fidelity preserves non-constant colour-channel data', () => {
+  const colorBlend = join(WORK, 'colors.blend');
+  const code = 'bpy.ops.wm.read_factory_settings(use_empty=True)\n' +
+    'bpy.ops.mesh.primitive_cube_add()\n' +
+    'a=bpy.context.object.data.color_attributes.new(name="Color", type="FLOAT_COLOR", domain="CORNER")\n' +
+    'for i,d in enumerate(a.data): d.color=(float(i%2),0.25,0.75,1.0)';
+  const setup = cli(['exec', code, '--save', colorBlend]);
+  if (!setup.json?.ok) return setup.json?.error || 'setup failed';
+  const r = cli(['export', join(WORK, 'colors.glb'), '--blend', colorBlend, '--strict']);
+  if (!r.json?.ok) return r.json?.error || 'strict export failed';
+  const f = r.json.result?.exported?.fidelity;
+  if (!f?.compared?.includes('color_nonconstant')) return 'colour variance was not compared';
+  return f.scene.color_nonconstant === 1 && f.file.color_nonconstant === 1 ? true : `variance ${JSON.stringify(f.detail)}`;
+});
+
+// --- 0.5.0: declarative acceptance + receipts -------------------------------
+check('accept writes a source-bound receipt and optional snapshot proof', () => {
+  const spec = join(WORK, 'accept.json');
+  const receipt = join(WORK, 'accept-receipt.json');
+  writeFileSync(spec, JSON.stringify({
+    version: 1, required_objects: [{ name: 'Camera', type: 'CAMERA' }, 'Cube'], required_types: { MESH: 1 },
+    max_errors: 0, snapshot: { out: 'accept.png', views: 'front', res: '64x48', min_coverage: 0.002 },
+  }));
+  const r = cli(['accept', spec, '--blend', BLEND, '--receipt', receipt]);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  if (!existsSync(receipt) || !existsSync(join(WORK, 'accept.png'))) return 'receipt or snapshot missing';
+  const value = JSON.parse(readFileSync(receipt, 'utf8'));
+  if (!value.passed || !/^[0-9a-f]{64}$/.test(value.spec?.sha256 || '') || !/^[0-9a-f]{64}$/.test(value.source?.sha256 || '')) return `bad receipt ${JSON.stringify(value)}`;
+  return /^[0-9a-f]{64}$/.test(value.snapshot?.sha256 || '') ? true : 'snapshot not hashed';
+});
+
+check('render --accept blocks before rendering when a requirement fails', () => {
+  const spec = join(WORK, 'reject.json');
+  const out = join(WORK, 'must-not-render.png');
+  writeFileSync(spec, JSON.stringify({ required_objects: ['NoSuchObject'] }));
+  const r = cli(['render', '--blend', BLEND, '--out', out, '--accept', spec, '--res', '32x24']);
+  if (r.code === 0) return 'render was allowed';
+  if (existsSync(out)) return 'render artifact exists despite failed acceptance';
+  return /render blocked/.test(r.json?.error || '') && r.json?.acceptance?.passed === false ? true : `unclear result ${JSON.stringify(r.json)}`;
+});
+
+// --- 0.5.0: installer + scoped schema ---------------------------------------
+check('install is idempotent and doctor verifies Codex and Claude skills', () => {
+  const a = cli(['install', 'all']);
+  if (!a.json?.ok || a.json.items?.some(i => !i.changed)) return `first install ${JSON.stringify(a.json)}`;
+  const b = cli(['install', 'all']);
+  if (!b.json?.ok || b.json.items?.some(i => i.changed)) return `second install ${JSON.stringify(b.json)}`;
+  const d = cli(['install', 'doctor']);
+  return d.json?.ok && d.json.items?.every(i => i.installed && i.current) ? true : `doctor ${JSON.stringify(d.json)}`;
+});
+
+check('schema can be bounded by command and effects', () => {
+  const r = cli(['schema', '--command', 'camera,nodes,render', '--effects', 'read']);
+  const names = r.json?.commands?.map(c => c.name);
+  return JSON.stringify(names) === JSON.stringify(['nodes', 'camera']) ? true : `commands ${JSON.stringify(names)}`;
+});
+
 // --- 0.4.0: schema ------------------------------------------------------------------
-const ALL_COMMANDS = ['doctor', 'new', 'exec', 'run', 'scene', 'verify', 'snapshot', 'add', 'keyframe', 'material', 'import', 'generate', 'export', 'render', 'job', 'addon', 'schema', 'version'];
+const ALL_COMMANDS = ['doctor', 'new', 'exec', 'run', 'scene', 'nodes', 'camera', 'verify', 'snapshot', 'accept', 'add', 'keyframe', 'material', 'import', 'generate', 'export', 'render', 'job', 'addon', 'install', 'schema', 'version'];
 check('schema lists exactly the command surface, each with a known effects annotation', () => {
   const r = cli(['schema'], { timeout: 20000 });
   if (!r.json?.commands) return 'no commands in schema';
