@@ -6,7 +6,7 @@
 
 import * as fdn from './foundation.js';
 import { spawnSync, spawn } from 'node:child_process';
-import { writeFileSync, existsSync, readFileSync, readSync, mkdtempSync, readdirSync, mkdirSync, statSync, openSync, closeSync, renameSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync, readSync, mkdtempSync, readdirSync, mkdirSync, statSync, openSync, closeSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve, dirname, basename, sep } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -276,6 +276,24 @@ function parseSentinel(out) {
   catch { return { ok: false, error: 'bad JSON from Blender', raw: m[1].slice(0, 800) }; }
 }
 
+function newerBlendHint(blend, bin) {
+  if (!blend || !existsSync(blend)) return null;
+  let fd;
+  try {
+    const header = Buffer.alloc(12);
+    fd = openSync(blend, 'r');
+    if (readSync(fd, header, 0, 12, 0) !== 12 || header.toString('ascii', 0, 7) !== 'BLENDER') return null;
+    const fileCode = Number(header.toString('ascii', 9, 12));
+    if (!Number.isInteger(fileCode)) return null;
+    const v = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const m = String(v.stdout || '').match(/Blender\s+(\d+)\.(\d+)/i);
+    if (!m || fileCode <= Number(m[1]) * 100 + Number(m[2])) return null;
+    return { error: `scene was saved by Blender ${Math.floor(fileCode / 100)}.${fileCode % 100}; this binary is Blender ${m[1]}.${m[2]}. Open it with the same or a newer Blender, or set --blender to that binary.`,
+      blend_file_version: `${Math.floor(fileCode / 100)}.${fileCode % 100}`, blender_version: `${m[1]}.${m[2]}` };
+  } catch { return null; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+
 function runBlender(body, opts = {}) {
   const p = prepareBlender(body, opts);
   if (!p.ok) return { ok: false, error: p.error };
@@ -283,17 +301,22 @@ function runBlender(body, opts = {}) {
   // agent's stdin can block forever waiting on a pipe nobody writes to (the
   // classic Windows headless hang) — and --timeout would then be the only thing
   // ending the call. stdout/stderr stay piped: that's the result channel.
-  const r = spawnSync(p.bin, p.args, {
-    encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    ...(p.timeoutMs > 0 ? { timeout: p.timeoutMs, killSignal: 'SIGKILL' } : {}),
-  });
-  if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, error: `Blender timed out after ${p.timeoutMs / 1000}s (killed)`, timed_out: true, bin: p.bin };
-  if (r.error) return { ok: false, error: `cannot run Blender (${p.bin}): ${r.error.message}`, bin: p.bin };
-  const out = r.stdout || '';
-  const parsed = parseSentinel(out);
-  if (!parsed) return { ok: false, error: 'no result from Blender (script may have crashed before emit)', exit: r.status, stderr_tail: (r.stderr || '').slice(-800), stdout_tail: out.slice(-800), bin: p.bin };
-  return parsed;
+  try {
+    const r = spawnSync(p.bin, p.args, {
+      encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...(p.timeoutMs > 0 ? { timeout: p.timeoutMs, killSignal: 'SIGKILL' } : {}),
+    });
+    if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, error: `Blender timed out after ${p.timeoutMs / 1000}s (killed)`, timed_out: true, bin: p.bin };
+    if (r.error) return { ok: false, error: `cannot run Blender (${p.bin}): ${r.error.message}`, bin: p.bin };
+    const out = r.stdout || '';
+    const parsed = parseSentinel(out);
+    if (!parsed) return { ok: false, error: 'no result from Blender (script may have crashed before emit)',
+      ...(newerBlendHint(opts.blend, p.bin) || {}), exit: r.status, stderr_tail: (r.stderr || '').slice(-800), stdout_tail: out.slice(-800), bin: p.bin };
+    return parsed;
+  } finally {
+    rmSync(p.dir, { recursive: true, force: true });
+  }
 }
 
 // --- Detached jobs: start Blender, return at once, poll later ---------------
@@ -303,6 +326,40 @@ function runBlender(body, opts = {}) {
 // so the CLI returns a job id immediately; `job status` reads progress from
 // Blender's own per-frame "Fra:" lines until the sentinel result appears.
 const JOBS_DIR = env.BLENDER_CLI_JOBS_DIR || process.env.BLENDER_CLI_JOBS_DIR || join(homedir(), '.cache', 'blender-cli', 'jobs');
+// The supervisor owns the deadline, so a detached Blender is stopped even if
+// nobody calls `job status`. It also reaps its Blender process group on cancel.
+const DETACHED_SUPERVISOR = String.raw`
+const { spawn } = require('node:child_process');
+const { rmSync } = require('node:fs');
+const { bin, args, timeoutMs, scriptDir } = JSON.parse(process.argv[1]);
+const windows = process.platform === 'win32';
+let child, finished = false;
+const cleanup = () => { try { rmSync(scriptDir, { recursive: true, force: true }); } catch {} };
+function stop() {
+  if (!child || !child.pid) return;
+  if (windows) {
+    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    killer.once('error', () => { try { child.kill('SIGKILL'); } catch {} });
+  } else {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch {} }
+  }
+}
+const timer = timeoutMs > 0 ? setTimeout(() => {
+  if (!finished) { process.stderr.write('__BCLI_TIMED_OUT__\n'); stop(); }
+}, timeoutMs) : null;
+process.on('SIGTERM', () => { process.stderr.write('__BCLI_CANCELLED__\n'); stop(); });
+try { child = spawn(bin, args, { detached: !windows, stdio: ['ignore', 'inherit', 'inherit'] }); }
+catch (e) { process.stderr.write(String(e.message) + '\n'); if (timer) clearTimeout(timer); cleanup(); process.exit(1); }
+child.once('error', e => {
+  process.stderr.write(String(e.message) + '\n');
+  if (timer) clearTimeout(timer);
+  cleanup(); process.exit(1);
+});
+child.once('exit', (code, signal) => {
+  finished = true; if (timer) clearTimeout(timer); cleanup();
+  process.exit(code == null ? (signal ? 128 : 1) : code);
+});
+`;
 const jobDir = (id) => join(JOBS_DIR, id);
 function readJob(id) {
   if (!id || /[\\/]/.test(id)) return null;
@@ -327,14 +384,20 @@ function runBlenderDetached(body, opts = {}, meta = {}) {
   const stdout = join(jobDir(id), 'stdout.log'), stderr = join(jobDir(id), 'stderr.log');
   const fo = openSync(stdout, 'a'), fe = openSync(stderr, 'a');
   let child;
-  try { child = spawn(p.bin, p.args, { detached: true, stdio: ['ignore', fo, fe] }); }
-  catch (e) { closeSync(fo); closeSync(fe); return { ok: false, error: `cannot start Blender (${p.bin}): ${e.message}` }; }
+  try {
+    const config = JSON.stringify({ bin: p.bin, args: p.args, timeoutMs: p.timeoutMs, scriptDir: p.dir });
+    child = spawn(process.execPath, ['-e', DETACHED_SUPERVISOR, config], { detached: true, stdio: ['ignore', fo, fe] });
+  } catch (e) {
+    closeSync(fo); closeSync(fe); rmSync(p.dir, { recursive: true, force: true });
+    return { ok: false, error: `cannot start Blender (${p.bin}): ${e.message}` };
+  }
   closeSync(fo); closeSync(fe);
   child.unref();
   const job = {
     id, pid: child.pid, command: meta.command || 'exec', started: new Date().toISOString(),
     bin: p.bin, blend: opts.blend || null, out: meta.out || null, frames: meta.frames || null,
-    status: 'running', stdout, stderr, ...(p.timeoutMs > 0 ? { timeout_at: Date.now() + p.timeoutMs } : {}),
+    status: 'running', stdout, stderr, script_dir: p.dir,
+    ...(p.timeoutMs > 0 ? { timeout_at: Date.now() + p.timeoutMs } : {}),
   };
   writeJob(job);
   return { ok: true, job: id, pid: child.pid, status: 'running', command: job.command, log: stdout,
@@ -345,12 +408,20 @@ function jobStatus(id) {
   if (!job) return { ok: false, error: `unknown job: ${id || '(none given)'}`, hint: 'blender-cli job list' };
   const out = existsSync(job.stdout) ? readFileSync(job.stdout, 'utf8') : '';
   const result = parseSentinel(out);
+  const err = existsSync(job.stderr) ? readFileSync(job.stderr, 'utf8') : '';
   let status;
   if (result) status = result.ok ? 'done' : 'failed';
   else if (job.status === 'cancelled') status = 'cancelled';
+  else if (err.includes('__BCLI_TIMED_OUT__')) status = 'timed_out';
+  else if (!job.script_dir && job.timeout_at && Date.now() > job.timeout_at && pidAlive(job.pid)) {
+    try { process.kill(job.pid, 'SIGKILL'); } catch { /* already gone */ }
+    status = 'timed_out';
+  }
   else if (!pidAlive(job.pid)) status = job.status === 'timed_out' ? 'timed_out' : 'failed';
-  else if (job.timeout_at && Date.now() > job.timeout_at) { try { process.kill(job.pid, 'SIGKILL'); } catch { /* already gone */ } status = 'timed_out'; }
   else status = 'running';
+  if (status !== 'running' && job.script_dir) {
+    try { rmSync(job.script_dir, { recursive: true, force: true }); } catch { /* a Windows process may still hold it briefly */ }
+  }
   if (status !== job.status) { job.status = status; if (status !== 'running') job.finished = job.finished || new Date().toISOString(); writeJob(job); }
   // Progress from Blender's own console: Cycles prints "Fra:12 Mem:..." per
   // frame, every engine prints "Saved: '...'" per written image, and video
@@ -385,12 +456,18 @@ function jobStatus(id) {
 // Downloads land in ~/.cache/blender-cli/ and are skipped when the file already
 // exists with the expected size, so repeat imports cost zero bytes.
 async function downloadTo(url, dest, expectedSize = null, { force = false } = {}) {
-  if (!force && existsSync(dest) && (expectedSize == null || statSync(dest).size === expectedSize)) return { cached: true };
+  if (!force && existsSync(dest) && (expectedSize == null || statSync(dest).size === Number(expectedSize))) return { cached: true };
   const r = await fetch(url);
   if (!r.ok) throw new Error(`download failed (${r.status}): ${url}`);
   const buf = Buffer.from(await r.arrayBuffer());
+  if (!buf.length) throw new Error(`download was empty: ${url}`);
+  if (expectedSize != null && buf.length !== Number(expectedSize)) {
+    throw new Error(`download size mismatch for ${url}: expected ${expectedSize} bytes, got ${buf.length}`);
+  }
   mkdirSync(dirname(dest), { recursive: true });
-  writeFileSync(dest, buf);
+  const tmp = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try { writeFileSync(tmp, buf); renameSync(tmp, dest); }
+  finally { rmSync(tmp, { force: true }); }
   return { cached: false, bytes: buf.length };
 }
 
@@ -419,7 +496,8 @@ async function polyhavenDownload(assetId, { type, res, maps = null }) {
   catch (e) { throw new Error(`polyhaven files ${assetId}: ${e.message}`); }
   const kind = type || PH_TYPE_NAMES[info.type] || 'texture';
   const outDir = join(homedir(), '.cache', 'blender-cli', 'polyhaven', assetId, res);
-  const wanted = maps?.length ? maps.map(x => x.toLowerCase()) : null;
+  const wanted = maps?.length ? maps.map(x => x.toLowerCase())
+    : ['diffuse', 'roughness', 'metallic', 'normal', 'displacement', 'opacity'];
   const dl = { kind, files: [], cached: 0, cache_dir: outDir,
     provenance: { provider: 'Poly Haven', source_url: `https://polyhaven.com/a/${assetId}`, license: 'CC0' } };
   const grab = async (url, dest, size) => {
@@ -450,6 +528,7 @@ async function polyhavenDownload(assetId, { type, res, maps = null }) {
       if (PH_NON_MAP_KEYS.has(mapName)) continue;
       const mn = mapName.toLowerCase();
       if (wanted && !wanted.some(w => [w, ...(PH_MAP_ALIASES[w] || [])].some(a => mn === a || mn.startsWith(a) || mn.includes(a)))) continue;
+      if (!maps?.length && mn.includes('nor_dx') && Object.keys(files).some(k => k.toLowerCase().includes('nor_gl'))) continue;
       const fmt = byRes?.[res] && (byRes[res].jpg || byRes[res].png || byRes[res].exr);
       if (!fmt) continue;
       maps[mapName] = await grab(fmt.url, join(outDir, basename(new URL(fmt.url).pathname)), fmt.size);
@@ -506,7 +585,9 @@ for p in PARAMS["files"]:
             "objects": [o.name for o in added],
             "verts": sum(len(o.data.vertices) for o in added if o.type == "MESH" and o.data)})
     except Exception as e:
-        items.append({"file": p, "ok": False, "error": str(e)})
+        partial = [o for o in bpy.data.objects if o.name not in before]
+        for o in partial: bpy.data.objects.remove(o, do_unlink=True)
+        items.append({"file": p, "ok": False, "error": str(e), "rolled_back_objects": len(partial)})
 _failed = [i for i in items if not i["ok"]]
 result["imported_batch"] = {"total": len(items), "succeeded": len(items) - len(_failed),
     "failed": len(_failed), "objects": sum(i.get("count", 0) for i in items), "items": items}`;
@@ -532,37 +613,46 @@ const TEXTURE_IMPORT_BODY = `mat = bpy.data.materials.new(PARAMS["material_name"
 mat.use_nodes = True
 nt = mat.node_tree
 bsdf = nt.nodes.get("Principled BSDF")
-ROUTE = {"Diffuse": ("Base Color", "sRGB"), "diff": ("Base Color", "sRGB"), "diffuse": ("Base Color", "sRGB"),
-    "Rough": ("Roughness", "Non-Color"), "rough": ("Roughness", "Non-Color"),
-    "Metal": ("Metallic", "Non-Color"), "metal": ("Metallic", "Non-Color"),
-    "nor_gl": ("Normal", "Non-Color"), "normal": ("Normal", "Non-Color"),
-    "Opacity": ("Alpha", "Non-Color")}
-added = []
+out = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+connected = []; unused = []
 for map_name, path in PARAMS["maps"].items():
+    key = map_name.lower()
+    target = ("Base Color" if any(x in key for x in ("diff", "albedo", "color")) else
+        "Roughness" if "rough" in key else "Metallic" if "metal" in key else
+        "Normal" if ("nor_gl" in key or key == "normal") else
+        "Displacement" if any(x in key for x in ("disp", "height")) else
+        "Alpha" if any(x in key for x in ("opacity", "alpha")) else None)
     tex = nt.nodes.new("ShaderNodeTexImage")
     tex.image = bpy.data.images.load(path)
     if PARAMS.get("pack"): tex.image.pack()
-    target, cs = ROUTE.get(map_name, (None, "Non-Color"))
+    cs = "sRGB" if target == "Base Color" else "Non-Color"
     try: tex.image.colorspace_settings.name = cs
     except Exception: pass
-    if target and bsdf:
-        if target == "Normal":
+    if target and bsdf and (target != "Displacement" or out):
+        if target == "Displacement" and out:
+            disp = nt.nodes.new("ShaderNodeDisplacement")
+            disp.inputs["Scale"].default_value = 0.1
+            nt.links.new(tex.outputs["Color"], disp.inputs["Height"])
+            nt.links.new(disp.outputs["Displacement"], out.inputs["Displacement"])
+        elif target == "Normal":
             nm = nt.nodes.new("ShaderNodeNormalMap")
             nt.links.new(tex.outputs["Color"], nm.inputs["Color"])
             nt.links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
         else:
             nt.links.new(tex.outputs["Color"], bsdf.inputs[target])
-    added.append(map_name)
+        connected.append(map_name)
+    else: unused.append(map_name)
 result["material"] = mat.name
-result["maps_added"] = added
+result["maps_added"] = list(PARAMS["maps"])
+result["maps_connected"] = connected
+result["maps_unused"] = unused
 result["packed"] = bool(PARAMS.get("pack"))`;
 
 // --safe gate: AST-validate agent code inside Blender, refuse on violations,
 // then exec in a CLEAN namespace (bpy/PARAMS/result only) so wrapper imports
 // like os/sys never leak in. Best-effort static gate, not a jail.
 const SAFE_EXEC_BODY = `import ast
-with open(PARAMS["__user__"], encoding="utf-8") as _f:
-    _src = _f.read()
+_src = PARAMS["__code__"]
 violations = []
 tree = None
 try:
@@ -759,11 +849,6 @@ async function execBody(body, args, ctx) {
   const safeMode = flags.unsafe ? false
     : flags.safe ? true
     : (env.BLENDER_CLI_SAFE ?? process.env.BLENDER_CLI_SAFE) === '1';
-  const writeUserFile = () => {
-    const f = join(mkdtempSync(join(tmpdir(), 'blender-cli-')), 'user.py');
-    writeFileSync(f, body);
-    return f;
-  };
   if (flags.check) {
     const checker = `import re
 code = PARAMS["__code__"]
@@ -795,7 +880,7 @@ result["checked_only"] = True`;
     // Version-aware API drift: only the rows that apply to THIS build are reported.
     if (r.result) r.result.api_drift = driftFor(body, r.result.bpy_version || null);
     if (r.ok && safeMode) {
-      const g = runBlender(SAFE_EXEC_BODY, { params: { __user__: writeUserFile(), __validate_only__: true }, flags });
+      const g = runBlender(SAFE_EXEC_BODY, { params: { __code__: body, __validate_only__: true }, flags });
       if (g.ok) r.result.safe_gate = g.result?.safe_gate || 'pass';
       else { r.ok = false; r.error = g.error; if (g.result?.violations) r.result.violations = g.result.violations; }
     }
@@ -804,13 +889,13 @@ result["checked_only"] = True`;
   }
   if (flags.detach) {
     const r = safeMode
-      ? runBlenderDetached(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __user__: writeUserFile() }, flags }, { command: 'exec' })
+      ? runBlenderDetached(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __code__: body }, flags }, { command: 'exec' })
       : runBlenderDetached(body, { blend: flags.blend, save: flags.save, flags }, { command: 'exec' });
     show(r, ctx); if (!r.ok) process.exit(1);
     return;
   }
   const r = safeMode
-    ? runBlender(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __user__: writeUserFile() }, flags })
+    ? runBlender(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __code__: body }, flags })
     : runBlender(body, { blend: flags.blend, save: flags.save, flags });
   // A failure on a known API move gets the matching hint appended, so the agent
   // learns the replacement from the error instead of from a second search.
@@ -890,7 +975,8 @@ else:
     for tree in bpy.data.node_groups: add_tree(tree, "node_group")
     for mat in bpy.data.materials: add_tree(getattr(mat, "node_tree", None), "material:" + mat.name)
     for world in bpy.data.worlds: add_tree(getattr(world, "node_tree", None), "world:" + world.name)
-    add_tree(getattr(bpy.context.scene, "node_tree", None), "scene")
+    sc = bpy.context.scene
+    add_tree(getattr(sc, "compositing_node_group", None) or getattr(sc, "node_tree", None), "scene")
     groups = []
     for tree, owner in trees:
         if not (fnmatch.fnmatch(tree.name.lower(), pattern.lower()) or pattern.lower().strip("*") in tree.name.lower()): continue
@@ -1552,6 +1638,12 @@ lights = [o for o in objs if o.type == "LIGHT"]
 
 if not cams: add("error", "no_camera", "scene has no camera; render will fail")
 if not lights: add("info", "no_light", "scene has no light; Cycles/EEVEE output will be black unless the world lights it")
+for image in bpy.data.images:
+    if image.source != "FILE" or image.packed_file or not image.filepath: continue
+    path = bpy.path.abspath(image.filepath)
+    if not os.path.isfile(path):
+        add("error", "missing_image", "external image file is missing; material or world may render without its texture",
+            image.name, path=path)
 
 def world_aabb(o):
     cs = [o.matrix_world @ Vector(c) for c in o.bound_box]
@@ -1827,10 +1919,13 @@ commands.snapshot = async (args, ctx) => {
   const out = resolve(flags.out || join(process.cwd(), 'snapshot.png'));
   if (flags.res !== undefined && !/^\d+x\d+$/i.test(String(flags.res))) { show({ ok: false, error: `invalid --res: ${flags.res} (WxH, e.g. 512x384)` }, ctx); process.exit(1); }
   const tmp = mkdtempSync(join(tmpdir(), 'blender-cli-snap-'));
-  const r = runBlender(SNAPSHOT_BODY, { blend: flags.blend, params: {
-    out, tmp, views: flags.views || null, res: flags.res || null, shading: flags.shading || null,
-    frame: flags.frame ?? null, bg: flags.bg ?? null,
-  }, flags });
+  let r;
+  try {
+    r = runBlender(SNAPSHOT_BODY, { blend: flags.blend, params: {
+      out, tmp, views: flags.views || null, res: flags.res || null, shading: flags.shading || null,
+      frame: flags.frame ?? null, bg: flags.bg ?? null,
+    }, flags });
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
   show(r, ctx); if (!r.ok) process.exit(1);
 };
 
@@ -1912,7 +2007,9 @@ function runAcceptance(specArg, { blend, receipt, flags }) {
       frame: snap.frame ?? null, bg: snap.bg ?? null } : {}),
   };
   const body = `${VERIFY_BODY}\n${snap ? SNAPSHOT_BODY : ''}\n${ACCEPT_ASSERTIONS}`;
-  const r = runBlender(body, { blend, params, flags });
+  let r;
+  try { r = runBlender(body, { blend, params, flags }); }
+  finally { if (tmp) rmSync(tmp, { recursive: true, force: true }); }
   if (r.ok && r.result?.acceptance && !r.result.acceptance.passed) {
     r.ok = false; r.error = `acceptance failed: ${r.result.acceptance.failures.length} requirement(s) unmet`;
   }
@@ -2313,7 +2410,10 @@ commands.job = async (args, ctx) => {
   if (sub === 'cancel') {
     const before = jobStatus(id);
     if (!before.job) { show(before, ctx); process.exit(1); }
-    if (before.status === 'running') { try { process.kill(before.pid, 'SIGKILL'); } catch { /* raced with exit */ } }
+    if (before.status === 'running') {
+      if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(before.pid), '/T', '/F'], { stdio: 'ignore' });
+      else { try { process.kill(before.pid, 'SIGTERM'); } catch { /* raced with exit */ } }
+    }
     const job = readJob(id);
     job.status = before.status === 'running' ? 'cancelled' : before.status;
     job.finished = job.finished || new Date().toISOString();
@@ -2401,8 +2501,8 @@ const COMMAND_SPECS = [
     summary: 'List, enable, disable or install add-ons and extensions headless; enable persists to user preferences unless --no-persist.' },
   { name: 'install', effects: ['files'], usage: 'blender-cli install codex|claude|all|doctor [--global]', flags: [FL('global', null, 'install under the user home instead of the current repository')],
     summary: 'Idempotently install or verify the generated skill for Codex and Claude Code.' },
-  { name: 'schema', effects: ['read'], usage: 'blender-cli schema [--command a,b] [--effects read,files] [--skill] [--out file]', flags: [FL('command', 'a,b', 'include only named commands'), FL('effects', 'a,b', 'include commands with any requested effect'), FL('skill', null, 'render a SKILL.md instead of JSON'), FL('out', 'path', 'write to a file')],
-    summary: 'Machine-readable command manifest, optionally filtered to the commands/effects an agent needs, or rendered as a drop-in skill.' },
+  { name: 'schema', effects: ['read'], usage: 'blender-cli schema [--command a,b] [--effects read,files] [--compact] [--skill] [--out file]', flags: [FL('command', 'a,b', 'include only named commands'), FL('effects', 'a,b', 'include commands with any requested effect'), FL('compact', null, 'omit prose and flag descriptions for a smaller JSON context'), FL('skill', null, 'render a SKILL.md instead of JSON'), FL('out', 'path', 'write to a file')],
+    summary: 'Machine-readable command manifest, optionally filtered or compacted to fit an agent context, or rendered as a drop-in skill.' },
   { name: 'version', effects: ['read'], usage: 'blender-cli version', flags: [], summary: 'Print name and version.' },
 ];
 
@@ -2506,14 +2606,17 @@ commands.schema = (args, ctx) => {
   }
   const manifest = buildManifest(specs);
   if (flags.out === true) { show({ ok: false, error: 'missing value for --out' }, ctx); process.exit(1); }
+  if (flags.skill && flags.compact) { show({ ok: false, error: '--compact emits JSON and cannot be combined with --skill' }, ctx); process.exit(1); }
   if (flags.skill) {
     const md = renderSkill(manifest);
     if (flags.out) { writeFileSync(resolve(flags.out), md); show({ ok: true, written: resolve(flags.out), bytes: Buffer.byteLength(md), format: 'skill' }, ctx); }
     else process.stdout.write(md);
     return;
   }
-  if (flags.out) { writeFileSync(resolve(flags.out), JSON.stringify(manifest, null, 2) + '\n'); show({ ok: true, written: resolve(flags.out), commands: specs.length, format: 'json' }, ctx); return; }
-  show(manifest, ctx);
+  const output = flags.compact ? { name: manifest.name, version: manifest.version,
+    commands: specs.map(c => ({ name: c.name, effects: c.effects, usage: c.usage, flags: c.flags.map(f => f.name) })) } : manifest;
+  if (flags.out) { writeFileSync(resolve(flags.out), JSON.stringify(output, null, 2) + '\n'); show({ ok: true, written: resolve(flags.out), commands: specs.length, format: 'json' }, ctx); return; }
+  show(output, ctx);
 };
 
 commands.version = (args, ctx) => show({ name: PKG.name, version: PKG.version }, ctx);
@@ -2577,7 +2680,7 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
   addon list [--all] | enable <module> [--no-persist] | disable <module> | install <file.py|.zip> [--enable]
                                add-ons and extensions, headless; enable persists to user prefs
   install codex|claude|all|doctor [--global]  idempotently install or verify generated agent skills
-  schema [--command a,b] [--effects read,files] [--skill] [--out f]
+  schema [--command a,b] [--effects read,files] [--compact] [--skill] [--out f]
                                the command surface as JSON with effects annotations,
                                or as a drop-in SKILL.md for your agent
   version                      print name + version
