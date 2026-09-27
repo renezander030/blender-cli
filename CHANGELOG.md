@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0 (unreleased)
+
+Nine reliability improvements for headless runs and saved assets. The 86-check end-to-end suite passes on Blender 4.3.2 and 5.2.0 LTS.
+
+### Added
+
+- `.blend` version-mismatch diagnostics when an older Blender exits before emitting JSON.
+- `verify` and `accept` findings for missing external image files.
+- `schema --compact` for a smaller JSON command manifest.
+- Poly Haven texture map results now identify connected and unused maps.
+
+### Fixed
+
+- Clean temporary scripts, safe-mode code and snapshot tiles after synchronous runs; detached supervisors clean scripts when Blender exits.
+- Enforce detached `--timeout` independently of job polling and cancel the Blender process tree.
+- Download only connectable Poly Haven texture maps by default, prefer OpenGL normal maps, and wire displacement maps to the material output.
+- Reject empty or size-mismatched asset downloads and replace cache files atomically.
+- Inspect compositor nodes through Blender 5's `compositing_node_group` property.
+- Roll back objects partially created by a failed batch import before continuing.
+
 ## 0.5.0 (2026-09-19)
 
 Nine additions make Blender automation easier to discover, gate, verify and hand to downstream tools. The suite now has 81 end-to-end checks and passes on Blender 4.3.2 and 5.2.0 LTS.

@@ -16,6 +16,20 @@
 npm install -g blender-cli && blender-cli doctor
 ```
 
+## New in v0.6.0
+
+Nine reliability improvements make long headless runs and saved assets easier to trust. The 86-check suite passes on Blender 4.3.2 and 5.2.0 LTS:
+
+- Temporary Blender scripts, safe-mode code and snapshot tiles are cleaned after each synchronous run, including failures.
+- Detached jobs enforce `--timeout` without waiting for a `job status` poll. Cancellation stops the Blender process tree, and the supervisor cleans its temporary scripts.
+- A `.blend` saved by a newer Blender now reports the file and running versions, with an actionable `--blender` hint when the older binary exits before returning JSON.
+- Poly Haven texture imports download the maps they can connect by default, prefer OpenGL normal maps, wire displacement to the material output and report unused maps. `--maps` still chooses an explicit set.
+- Asset downloads reject empty or size-mismatched responses and atomically replace cache files only after validation.
+- `verify` and `accept` flag missing external image files before a render silently loses textures.
+- `nodes inspect` reads the Blender 5 compositor group as well as the legacy scene node tree.
+- Batch import removes objects left by a failed file before trying the next asset; each failed item reports the rollback count.
+- `schema --compact` returns a smaller JSON command manifest for agent contexts while preserving command names, effects, usage and flag names.
+
 ## New in v0.5.0
 
 Nine additions make an automated Blender run discoverable before execution and provable afterward:
@@ -181,7 +195,7 @@ One JSON object on stdout per invocation; exit code 1 exactly when `ok` is false
 | `job list \| status <id> \| wait <id> [--timeout sec] [--poll sec] \| cancel <id>` | The other half of `--detach`: frames done (and percent when the range is known) while it runs, the final result once Blender is finished. Jobs live in `~/.cache/blender-cli/jobs` (`BLENDER_CLI_JOBS_DIR` overrides). |
 | `addon list [--all] \| enable <module> [--no-persist] \| disable <module> \| install <file.py\|.zip> [--enable]` | Add-ons and extensions without a UI. `enable` persists to user preferences (the point of it); `--no-persist` tries it for the one call. `install` takes a legacy add-on or an extension package (`blender_manifest.toml`, 4.2+). |
 | `install codex\|claude\|all\|doctor [--global]` | Idempotently install or verify the generated Blender CLI skill for agent clients. |
-| `schema [--command a,b] [--effects read,files] [--skill] [--out file]` | The full or scoped command surface as JSON with effects annotations, or as a drop-in SKILL.md. |
+| `schema [--command a,b] [--effects read,files] [--compact] [--skill] [--out file]` | The full, scoped or compact command surface as JSON with effects annotations, or as a drop-in SKILL.md. |
 | `version` | Print name and version. |
 
 Batch patterns must be quoted so the shell does not expand them first; `*` and `?` work in the last path segment, `**` does not.

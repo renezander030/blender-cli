@@ -11,7 +11,7 @@
 // matrix in the CLI: a version is only listed there once this suite passes on it.
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, readdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,7 +31,7 @@ const failures = [];
 const JOBS = join(WORK, 'jobs');
 
 function cli(args, { timeout = 180000, env = null } = {}) {
-  const full = BLENDER ? [...args, '--blender', BLENDER] : args;
+  const full = BLENDER && !args.includes('--blender') ? [...args, '--blender', BLENDER] : args;
   const r = spawnSync(process.execPath, [CLI, ...full], {
     encoding: 'utf8', timeout, maxBuffer: 64 * 1024 * 1024, cwd: WORK,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -817,6 +817,55 @@ check('schema --skill renders a skill file with frontmatter and every command', 
   if (!r.stdout.startsWith('---\nname: blender-cli')) return 'no frontmatter';
   const missing = ALL_COMMANDS.filter(n => !r.stdout.includes(`blender-cli ${n}`));
   return missing.length ? `missing ${missing}` : true;
+});
+
+// --- 0.6.0: process lifecycle, diagnostics and smaller schemas -------------
+check('synchronous safe runs remove their private script directories', () => {
+  const temp = join(WORK, 'isolated-temp');
+  mkdirSync(temp);
+  const r = cli(['exec', 'result["value"] = 1', '--safe'], { env: { TMPDIR: temp } });
+  if (!r.json?.ok) return r.json?.error || 'safe run failed';
+  const leftovers = readdirSync(temp).filter(n => n.startsWith('blender-cli-'));
+  return leftovers.length === 0 ? true : `leftover temp directories: ${leftovers}`;
+});
+
+check('detached timeout fires without a status poll', () => {
+  const r = cli(['exec', 'import time; time.sleep(20)', '--detach', '--timeout', '1']);
+  if (!r.json?.job) return r.json?.error || 'no job id';
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);
+  const s = cli(['job', 'status', r.json.job]);
+  return s.json?.status === 'timed_out' && s.json?.error?.includes('timeout') ? true : `status ${JSON.stringify(s.json)}`;
+});
+
+check('older Blender reports a newer .blend version when startup fails', () => {
+  if (process.platform === 'win32') return true;
+  const file = join(WORK, 'newer.blend');
+  writeFileSync(file, 'BLENDER-v502');
+  const fake = join(WORK, 'fake-blender');
+  writeFileSync(fake, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "Blender 4.3.2"; else exit 1; fi\n');
+  chmodSync(fake, 0o755);
+  const r = cli(['scene', '--blend', file, '--blender', fake]);
+  return r.code !== 0 && r.json?.blend_file_version === '5.2' && /newer Blender/.test(r.json?.error || '')
+    ? true : `diagnostic ${JSON.stringify(r.json)}`;
+});
+
+check('verify catches missing external images', () => {
+  const image = join(WORK, 'external.png');
+  const blend = join(WORK, 'missing-image.blend');
+  const code = `im=bpy.data.images.new("ExternalSmoke", width=1, height=1)\nim.filepath_raw=${JSON.stringify(image)}\nim.file_format="PNG"\nim.save()\nbpy.data.images.remove(im)\nim=bpy.data.images.load(${JSON.stringify(image)})\nim.use_fake_user=True`;
+  const setup = cli(['exec', code, '--blend', BLEND, '--save', blend]);
+  if (!setup.json?.ok) return setup.json?.error || 'setup failed';
+  rmSync(image);
+  const r = cli(['verify', '--blend', blend]);
+  return r.code !== 0 && r.json?.result?.verified?.findings?.some(f => f.check === 'missing_image')
+    ? true : `findings ${JSON.stringify(r.json?.result?.verified?.findings)}`;
+});
+
+check('schema --compact retains command metadata with less output', () => {
+  const full = cli(['schema', '--command', 'render,nodes']);
+  const small = cli(['schema', '--command', 'render,nodes', '--compact']);
+  return small.json?.commands?.length === 2 && small.json.commands.every(c => c.name && c.effects?.length && c.usage && c.flags?.length)
+    && small.stdout.length < full.stdout.length / 2 ? true : 'compact schema is missing fields or not smaller';
 });
 
 // --- report ------------------------------------------------------------------
