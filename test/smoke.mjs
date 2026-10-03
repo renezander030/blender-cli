@@ -799,7 +799,7 @@ check('schema can be bounded by command and effects', () => {
 });
 
 // --- 0.4.0: schema ------------------------------------------------------------------
-const ALL_COMMANDS = ['doctor', 'new', 'exec', 'run', 'scene', 'nodes', 'camera', 'verify', 'snapshot', 'accept', 'add', 'keyframe', 'material', 'import', 'generate', 'export', 'render', 'job', 'addon', 'install', 'schema', 'version'];
+const ALL_COMMANDS = ['diff', 'assets', 'receipt', 'doctor', 'new', 'exec', 'run', 'scene', 'nodes', 'camera', 'verify', 'snapshot', 'accept', 'add', 'keyframe', 'material', 'import', 'generate', 'export', 'render', 'job', 'addon', 'install', 'schema', 'version'];
 check('schema lists exactly the command surface, each with a known effects annotation', () => {
   const r = cli(['schema'], { timeout: 20000 });
   if (!r.json?.commands) return 'no commands in schema';
