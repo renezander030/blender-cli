@@ -1,0 +1,39 @@
+name: Blender conformance
+on:
+  pull_request:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        blender: ['4.3.2', '5.2.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Blender runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libxrender1 libxi6 libxkbcommon0 libsm6 libegl1 libgl1
+      - name: Download portable Blender and verify checksum
+        env:
+          BLENDER_VERSION: ${{ matrix.blender }}
+        run: |
+          series="${BLENDER_VERSION%.*}"
+          archive="blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 "https://download.blender.org/release/Blender${series}/${archive}" -o "$archive"
+          curl --fail --location --retry 3 "https://download.blender.org/release/Blender${series}/blender-${BLENDER_VERSION}.sha256" -o blender.sha256
+          sha256sum --check --ignore-missing blender.sha256
+          tar -xf "$archive"
+      - name: Run complete conformance suite
+        env:
+          BLENDER_VERSION: ${{ matrix.blender }}
+        run: npm test -- --blender "$RUNNER_TEMP/blender-${BLENDER_VERSION}-linux-x64/blender"
+      - name: Check package contents
+        run: npm pack --dry-run

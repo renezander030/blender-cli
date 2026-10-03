@@ -1,6 +1,31 @@
 # Changelog
 
-## 0.6.0 (unreleased)
+## 0.7.0 (unreleased)
+
+The 106-check suite passes on Blender 4.3.2 and 5.2.0.
+
+### Added
+
+- Read-only `diff` for object identity, hierarchy, transforms, evaluated geometry, bounds, material assignments and scene settings; optional `--fail-on-change`.
+- Poly Haven `assets search` with name/tag matching, type/category filters, bounded results and a refreshable catalogue cache.
+- `receipt verify` to recheck acceptance source, spec and optional visual-proof hashes.
+- Export `--options` as JSON or `@file`, checked against the running export operator's types, enums and ranges.
+- Content-bound batch render/export manifests and `--resume`, with per-item progress, dependency checks and output verification.
+- Complete local glTF dependency hashes and a stable bundle hash.
+
+### Fixed
+
+- Include evaluated non-mesh geometry and collection instances in export fidelity; refuse strict success when readback is unavailable.
+- Stage scene saves beside their destination and refuse publication if that destination changed during the run. Clean temporary saves after synchronous and detached failures.
+- Reject unknown acceptance fields, malformed nested rules and coercible wrong types. Apply acceptance separately to every batch scene and keep per-scene receipts and snapshots.
+- Preserve the JSON error contract for router failures and report export degradation against each failed batch item.
+
+### Compatibility
+
+- Acceptance specs must use correctly typed values and supported field names.
+- `--strict --no-verify` is rejected because strict export requires readback evidence.
+
+## 0.6.0 (2026-09-27)
 
 Nine reliability improvements for headless runs and saved assets. The 86-check end-to-end suite passes on Blender 4.3.2 and 5.2.0 LTS.
 

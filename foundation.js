@@ -196,7 +196,7 @@ export function table(rows, columns) {
 // run({ commands, help }, argv): dispatches argv[0] to commands[verb](rest, ctx).
 // commands.help (or the help fn) handles --help / -h / no-args.
 // ctx = { human } so handlers know which output mode to use.
-export async function run({ commands, help }, argv) {
+export async function run({ commands, help, onError = null }, argv) {
   const { human, rest } = extractHuman(argv);
   const cmd = rest[0];
   const showHelp = () => {
@@ -206,10 +206,14 @@ export async function run({ commands, help }, argv) {
   };
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { showHelp(); process.exit(0); }
   const fn = commands[cmd];
-  if (!fn) { console.error(`Unknown command: ${cmd}`); showHelp(); process.exit(1); }
+  if (!fn) {
+    if (onError) { onError(new Error(`Unknown command: ${cmd}`), { human }); process.exitCode = 1; return; }
+    console.error(`Unknown command: ${cmd}`); showHelp(); process.exit(1);
+  }
   try {
     await fn(rest.slice(1), { human });
   } catch (e) {
+    if (onError) { onError(e, { human }); process.exitCode = 1; return; }
     console.error(`Error: ${e.message}`);
     process.exit(1);
   }

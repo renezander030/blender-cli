@@ -16,6 +16,22 @@
 npm install -g blender-cli && blender-cli doctor
 ```
 
+## New in v0.7.0
+
+Nine additions make scene edits, acceptance and asset delivery easier to check:
+
+- Export readback counts evaluated geometry, including text, curves, metaballs and collection instances. `--strict` fails when readback is unavailable, and cannot be combined with `--no-verify`.
+- Scene saves write a temporary sibling first, check that the destination still matches its starting hash, and atomically replace it. Results include `saved_artifact` with the final SHA-256 and size.
+- Acceptance specs reject unknown fields, invalid nested rules and incorrectly typed values. Batch rendering checks each scene and writes a separate receipt and optional snapshot for it.
+- `export --options '{"export_apply":true}'` (or `--options @export.json`) validates format-specific settings against the running Blender's operator API. Output, selection and animation switches remain controlled by the CLI.
+- Batch render/export can write a `--manifest progress.json` and `--resume`. A completed item is skipped only when its scene, settings, recorded dependencies, output files and optional acceptance receipt still match.
+- `diff before.blend after.blend` reports added, removed and changed objects, hierarchy, world transforms, evaluated geometry, bounds, material assignments and scene settings. `--fail-on-change` gives comparisons a non-zero exit when they differ.
+- `assets search wood --type texture --category wood` discovers Poly Haven asset IDs by name, category and tags. Results include import IDs, CC0 attribution and source URLs, with a one-hour catalogue cache.
+- glTF exports validate and hash their referenced local buffers and textures as well as the main JSON file. `exported.artifacts` lists every member and `bundle_sha256` binds their URI, size and hash.
+- `receipt verify acceptance.receipt.json` checks that a passing acceptance receipt still matches the current scene, spec and optional snapshot.
+
+Acceptance validation is stricter in this release: numeric strings, booleans used as counts and misspelled rule names are rejected. Existing correctly typed specs continue to work.
+
 ## New in v0.6.0
 
 Nine reliability improvements make long headless runs and saved assets easier to trust. The 86-check suite passes on Blender 4.3.2 and 5.2.0 LTS:
@@ -206,7 +222,7 @@ Batch patterns must be quoted so the shell does not expand them first; `*` and `
 
 | Version | Status |
 |---|---|
-| 4.3.2, 5.2.0 LTS | tested — the v0.5.0 suite passes 81/81 on both builds. |
+| 4.3.2, 5.2.0 LTS | tested — the v0.7.0 suite passes 106/106 on both builds. |
 | 3.0 – 5.x, otherwise | untested; engines and import/export operators are resolved from the running build, so it may well work. [Report breakage.](https://github.com/renezander030/blender-cli/issues) |
 | below 3.0 | unsupported |
 
@@ -229,17 +245,51 @@ Blender never inherits the agent's stdin — a child holding an inherited pipe c
 
 **Detached jobs:** `--detach` spawns Blender unref'd with stdout/stderr going to `~/.cache/blender-cli/jobs/<id>/`. `job status` parses Blender's own per-frame console lines for progress until the sentinel result appears, so nothing else is running in between: no daemon, no socket, just a process and a log.
 
+## Comparing, resuming and verifying delivery
+
+```bash
+blender-cli diff original.blend candidate.blend --fail-on-change
+blender-cli assets search "wooden table" --type model --limit 5
+blender-cli export model.gltf --blend scene.blend --strict --options '{"export_apply":true}'
+blender-cli render --batch "shots/*.blend" --out renders/ --engine workbench \
+  --manifest render-progress.json
+blender-cli render --batch "shots/*.blend" --out renders/ --engine workbench \
+  --manifest render-progress.json --resume
+blender-cli export exports/ --batch "shots/*.blend" --format gltf \
+  --strict --manifest export-progress.json --resume
+blender-cli receipt verify acceptance.receipt.json
+```
+
+A diff compares the saved frame unless `--frame` selects the same frame in both files. `--tolerance` defaults to `0.000001` for numeric transforms and bounds; the geometry digest rounds local vertex coordinates to six decimal places and includes polygon topology and material indices. A changed state is a factual report, not a quality judgment. The comparison covers the fields listed above; it does not compare shader socket values, every modifier parameter or sampled animation curves.
+
+`--options` accepts a JSON object or `@file.json`. Keys and value types must exist in the installed export operator; enum values and numeric ranges are checked there. The CLI reserves `filepath`, `directory`, `files`, `check_existing`, format, selection and animation controls. Use the corresponding CLI switches for those settings. An option available on one Blender build can correctly fail on another.
+
+Manifests are optional and apply to batch render/export. Keep the same output directory and work settings on a resumed invocation. Each item records scene and output hashes, local file images and linked libraries, and any acceptance receipt. Changed or missing recorded files force that item to run again. Image sequences, tiled textures and movie textures disable reuse; simulation caches and remote dependencies are not fully tracked, so rerun without `--resume` when those inputs change. Failed items are recorded and retried while other files continue. A manifest must end in `.json` and be separate from sources, dependencies, acceptance specs and output files. An existing path must contain a valid blender-cli batch manifest; unrelated JSON files are rejected even without `--resume`.
+
+For `render --batch ... --accept spec.json`, each scene is checked separately. Receipts default to `<output-dir>/<scene>.acceptance.receipt.json`; `--receipt <directory>` changes their directory. Snapshot proof uses a separate `<scene>.acceptance.snapshot.png` for every scene, overriding the single-file `snapshot.out` setting in batch mode.
+
+Receipt verification checks file contents and a recorded passing decision. It does not authenticate who created a receipt. Keep receipts with their artifacts; paths are absolute, so moving an artifact requires rerunning acceptance to produce new evidence.
+
+Poly Haven search uses case-insensitive text matching, with exact and prefix matches first. `--refresh` refreshes the catalogue; `BLENDER_CLI_CACHE_DIR` can move the search cache. Powered by [Poly Haven](https://polyhaven.com). Search does not download asset files. Imports retain their existing download cache.
+
 ## Tests
 
 ```bash
-node test/smoke.mjs                          # against whatever `blender` resolves to
-node test/smoke.mjs --blender /path/to/blender
+npm test                                    # against whatever `blender` resolves to
+npm test -- --blender /path/to/blender
+node test/release.mjs --blender /path/to/blender  # v0.7 regressions only
 ```
 
-81 end-to-end checks against a real Blender — no mocking of the boundary, because the boundary (operator names, engine identifiers, exporter behaviour) is exactly what drifts between versions. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache.
+106 end-to-end checks (86 smoke checks and 20 release regressions) run against a real Blender. Release regressions also inject an unavailable importer to check the failure contract and use a cached catalogue fixture to check asset discovery. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache. Separate publishing policy checks exercise the owner/commit review gate, version matching and registry conflicts without publishing.
 
 ## License
 
 MIT. See [LICENSE](./LICENSE).
 
 > **Disclaimer:** Independent, community project. **Not affiliated with, sponsored by, or endorsed by** the Blender Foundation. "Blender" is a trademark of the Blender Foundation, used here only for identification (nominative) purposes. The blender-cli logo is an original mark and deliberately distinct from the Blender logo, which is a registered property of the Blender Foundation.
+
+## Release publishing
+
+Pull requests run the complete suite against Blender 4.3.2 and 5.2.0. After the repository owner merges a `release/v<version>` PR and the checks pass on that exact `master` commit, the publishing workflow releases the matching npm package with provenance and creates a GitHub Release with the tarball and SHA-256 checksum. It requires an `NPM_TOKEN` repository secret with publishing access. Direct pushes and unsuccessful checks do not publish. Already published identical packages are reused; version or tag conflicts fail visibly.
+
+This repository distributes a JavaScript CLI on npm. It does not distribute a Python package or implement an MCP server.
