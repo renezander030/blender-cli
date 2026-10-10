@@ -16,6 +16,22 @@
 npm install -g blender-cli && blender-cli doctor
 ```
 
+## New in v0.8.0
+
+Nine additions make agent runs safer to approve, easier to review and easier to undo. The 117-check suite passes on Blender 4.3.2 and 5.2.0 LTS:
+
+- **Allowlisted `--safe` imports.** Safe-mode code imports from a fixed allowlist (`bpy`, `bmesh`, `mathutils`, `numpy`, `math`, `random`, `json` and other pure-computation modules), checked statically and again at runtime. Private and dunder attributes, module objects re-exported by allowed modules, computed `getattr` escapes, `Text.as_module`, preset and script runners, and write-mode `open` are refused. Script auto-execution stays off for the run.
+- **Approval binding.** `exec --check` and `run --check` report `code_sha256`. `--expect-sha256 <hex>` runs the code only when it hashes to the reviewed value, so an approval covers exactly the code that executes.
+- **Save versions.** `--save` over an existing scene keeps the replaced file as `scene.blend1` (rotating to `.blend2` and beyond when Blender's Save Versions preference asks for it) and reports it as `saved_artifact.backup`. `--no-backup` skips it.
+- **Change summaries.** `--diff` on `exec`, `run`, `add`, `keyframe`, `material` and `import` compares the scene before and after the command in the same session and returns `changes`: added, removed and changed objects with the changed fields, plus changed scene settings.
+- **Import arrival check.** An import that adds no objects fails with an actionable error (`--allow-empty` accepts it). Every import reports each arrived object's parent and the hierarchy roots; `scene` reports parents too.
+- **API drift for 4.x and 5.x.** The drift guard names `use_auto_smooth` (4.1), `calc_normals`/`calc_normals_split` (4.0/4.1), face maps and node-group `inputs.new` (4.0), `shadow_method` (4.2), the `bgl` module and VSE `sequences` (5.0), each with its replacement.
+- **Readable node discovery.** `nodes find` returns each node's UI label and description, matches searches against them, and leaves out abstract base classes.
+- **Stall detection.** Running jobs report `idle_s`, the seconds since Blender last wrote output. `job wait --stall-after <sec>` returns `stalled: true` when that passes the limit and leaves the job running for you to inspect or cancel.
+- **Provider requests with deadlines and retries.** Poly Haven and Meshy requests time out (`BLENDER_CLI_HTTP_TIMEOUT`, default 60 s; downloads `BLENDER_CLI_DOWNLOAD_TIMEOUT`, default 600 s) and retry transient failures with `Retry-After` or exponential backoff (`BLENDER_CLI_HTTP_RETRIES`, default 3). Generation requests are retried only when the provider refused them.
+
+Safe mode refuses imports outside its allowlist; pass `--unsafe` for code that needs other modules.
+
 ## New in v0.7.0
 
 Nine additions make scene edits, acceptance and asset delivery easier to check:
@@ -278,9 +294,10 @@ Poly Haven search uses case-insensitive text matching, with exact and prefix mat
 npm test                                    # against whatever `blender` resolves to
 npm test -- --blender /path/to/blender
 node test/release.mjs --blender /path/to/blender  # v0.7 regressions only
+node test/v080.mjs --blender /path/to/blender     # v0.8 checks only
 ```
 
-106 end-to-end checks (86 smoke checks and 20 release regressions) run against a real Blender. Release regressions also inject an unavailable importer to check the failure contract and use a cached catalogue fixture to check asset discovery. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache. Separate publishing policy checks exercise the owner/commit review gate, version matching and registry conflicts without publishing.
+117 end-to-end checks (86 smoke checks, 20 v0.7 regressions and 11 v0.8 checks) run against a real Blender. The v0.8 checks run provider retries against a local stand-in server. Release regressions also inject an unavailable importer to check the failure contract and use a cached catalogue fixture to check asset discovery. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache. Separate publishing policy checks exercise the owner/commit review gate, version matching and registry conflicts without publishing.
 
 ## License
 

@@ -1,6 +1,32 @@
 # Changelog
 
-## 0.7.0 (unreleased)
+## 0.8.0 (unreleased)
+
+The 117-check suite passes on Blender 4.3.2 and 5.2.0.
+
+### Added
+
+- `exec/run --check` reports `code_sha256`; `--expect-sha256 <hex>` runs the code only when it matches.
+- `--save` keeps the replaced scene as `.blend1` (more versions per Blender's Save Versions preference) and reports `saved_artifact.backup`; `--no-backup` skips it.
+- `--diff` on `exec`, `run`, `add`, `keyframe`, `material` and `import` returns `changes` between the scene before and after the command.
+- Imports report each object's parent and the hierarchy roots; `scene` reports parents. `--allow-empty` accepts an import that adds no objects.
+- API drift rows for `use_auto_smooth`, `calc_normals`, `calc_normals_split`, face maps, node-group `inputs/outputs.new`, `shadow_method`, `bgl` and VSE `sequences`.
+- `nodes find` returns UI labels and descriptions and searches them.
+- Running jobs report `idle_s`; `job wait --stall-after <sec>` returns `stalled: true` without stopping the job.
+- Provider request deadlines and retries: `BLENDER_CLI_HTTP_TIMEOUT`, `BLENDER_CLI_DOWNLOAD_TIMEOUT`, `BLENDER_CLI_HTTP_RETRIES`; `POLYHAVEN_API_BASE` selects the Poly Haven endpoint.
+
+### Changed
+
+- `--safe` resolves imports against an allowlist both statically and at runtime, refuses private and dunder attributes, module objects re-exported by allowed modules, blocked names reached through `getattr`, text-block, preset and script runners, and write-mode `open`, and keeps script auto-execution off for the run.
+- `nodes find` leaves out abstract node base classes.
+- An import that finishes without adding objects, or whose importer does not finish, is an error.
+
+### Compatibility
+
+- Safe-mode code that imports modules outside the allowlist, or reads private attributes, now needs `--unsafe`.
+- Scripts that import an intentionally empty file need `--allow-empty`.
+
+## 0.7.0 (2026-10-03)
 
 The 106-check suite passes on Blender 4.3.2 and 5.2.0.
 
