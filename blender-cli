@@ -17,6 +17,10 @@ const PKG = JSON.parse(readFileSync(join(DIR, 'package.json'), 'utf8'));
 
 // Consistent output: terse JSON line by default, pretty JSON with -H/--human.
 const show = (r, ctx) => fdn.emit(r, { human: ctx?.human, table: () => JSON.stringify(r, null, 2) });
+// The output contract: one JSON object per invocation, exit code 1 exactly when
+// ok is false. reply() emits a result and enforces it; fail() is the refusal path.
+const reply = (r, ctx) => { show(r, ctx); if (!r.ok) process.exit(1); };
+const fail = (payload, ctx) => { show({ ok: false, ...payload }, ctx); process.exit(1); };
 
 function fileProof(path) {
   const p = resolve(path);
@@ -1174,8 +1178,7 @@ commands.doctor = async (args, ctx) => {
   const { bin, tried } = blenderBinInfo(flags);
   const ver = spawnSync(bin, ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   if (ver.error) {
-    show({ ok: false, blender_bin: bin, error: `not found/executable: ${ver.error.message}`, searched: tried, hint: 'set BLENDER_BIN or pass --blender <path>' }, ctx);
-    process.exit(1);
+    fail({ blender_bin: bin, error: `not found/executable: ${ver.error.message}`, searched: tried, hint: 'set BLENDER_BIN or pass --blender <path>' }, ctx);
   }
   const versionLine = (ver.stdout || '').split('\n')[0].trim();
   const probe = runBlender(`result["bpy_version"] = list(bpy.app.version)
@@ -1264,10 +1267,10 @@ async function execBody(body, args, ctx) {
   if (flags['expect-sha256'] !== undefined) {
     const expected = String(flags['expect-sha256']).trim().toLowerCase();
     if (flags['expect-sha256'] === true || !/^[a-f0-9]{64}$/.test(expected)) {
-      show({ ok: false, error: 'invalid --expect-sha256 (64 hex characters, as reported by --check)' }, ctx); process.exit(1);
+      fail({ error: 'invalid --expect-sha256 (64 hex characters, as reported by --check)' }, ctx);
     }
     if (expected !== codeSha256) {
-      show({ ok: false, error: 'code does not match the approved SHA-256; nothing was run', expected_sha256: expected, code_sha256: codeSha256 }, ctx); process.exit(1);
+      fail({ error: 'code does not match the approved SHA-256; nothing was run', expected_sha256: expected, code_sha256: codeSha256 }, ctx);
     }
   }
   if (flags.check) {
@@ -1306,14 +1309,14 @@ result["checked_only"] = True`;
       if (g.ok) r.result.safe_gate = g.result?.safe_gate || 'pass';
       else { r.ok = false; r.error = g.error; if (g.result?.violations) r.result.violations = g.result.violations; }
     }
-    show(r, ctx); if (!r.ok) process.exit(1);
+    reply(r, ctx);
     return;
   }
   if (flags.detach) {
     const r = safeMode
       ? runBlenderDetached(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __code__: body, __allowed_modules__: SAFE_ALLOWED_MODULES }, flags }, { command: 'exec' })
       : runBlenderDetached(body, { blend: flags.blend, save: flags.save, flags }, { command: 'exec' });
-    show(r, ctx); if (!r.ok) process.exit(1);
+    reply(r, ctx);
     return;
   }
   const r = safeMode
@@ -1325,17 +1328,17 @@ result["checked_only"] = True`;
     const drift = driftFor(body, r.bpy_version);
     if (drift.length) r.api_drift = drift;
   }
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 }
 commands.exec = async (args, ctx) => {
   const { positional } = fdn.parseArgs(args, EXEC_FLAGS);
-  if (!positional.length) { show({ ok: false, error: 'missing bpy code', usage: EXEC_USAGE }, ctx); process.exit(1); }
+  if (!positional.length) fail({ error: 'missing bpy code', usage: EXEC_USAGE }, ctx);
   await execBody(positional.join(' '), args, ctx);
 };
 commands.run = async (args, ctx) => {
   const { positional } = fdn.parseArgs(args, EXEC_FLAGS);
   const file = positional[0];
-  if (!file || !existsSync(file)) { show({ ok: false, error: `script not found: ${file || '(none given)'}`, usage: 'blender-cli run <script.py> [--blend f.blend] [--save out.blend] [--check] [--safe] [--detach] [--timeout sec]' }, ctx); process.exit(1); }
+  if (!file || !existsSync(file)) fail({ error: `script not found: ${file || '(none given)'}`, usage: 'blender-cli run <script.py> [--blend f.blend] [--save out.blend] [--check] [--safe] [--detach] [--timeout sec]' }, ctx);
   await execBody(readFileSync(file, 'utf8'), args, ctx);
 };
 
@@ -1359,8 +1362,7 @@ result["materials"] = [m.name for m in bpy.data.materials]
 result["cameras"] = [o.name for o in sc.objects if o.type == "CAMERA"]
 result["lights"] = [o.name for o in sc.objects if o.type == "LIGHT"]`;
   const r = runBlender(body, { blend: flags.blend, flags });
-  show(r, ctx);
-  if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `nodes find|inspect` — discover the node vocabulary exposed by this exact
@@ -1422,14 +1424,14 @@ commands.nodes = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, ['blend', 'kind', 'search', 'group', 'limit', ...COMMON_FLAGS]);
   const mode = positional[0] || 'find';
   if (!['find', 'inspect'].includes(mode)) {
-    show({ ok: false, error: `unknown nodes subcommand: ${mode}`, usage: 'blender-cli nodes find [--kind geometry|shader|compositor|all] [--search pattern] [--limit N] | nodes inspect [--group pattern] [--blend f]' }, ctx); process.exit(1);
+    fail({ error: `unknown nodes subcommand: ${mode}`, usage: 'blender-cli nodes find [--kind geometry|shader|compositor|all] [--search pattern] [--limit N] | nodes inspect [--group pattern] [--blend f]' }, ctx);
   }
   const limit = flags.limit === undefined ? 100 : Number(flags.limit);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 500) { show({ ok: false, error: `invalid --limit: ${flags.limit} (integer 1..500)` }, ctx); process.exit(1); }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) fail({ error: `invalid --limit: ${flags.limit} (integer 1..500)` }, ctx);
   const r = runBlender(NODES_BODY, { blend: flags.blend, params: {
     mode, kind: flags.kind || 'all', search: flags.search || '*', group: flags.group || '*', limit,
   }, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `camera` — emit calibration metadata for CV and synthetic-data pipelines.
@@ -1476,7 +1478,7 @@ result["camera"] = {"name": o.name, "frame": sc.frame_current, "resolution": [rx
 commands.camera = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, ['blend', 'frame', ...COMMON_FLAGS]);
   const r = runBlender(CAMERA_BODY, { blend: flags.blend, params: { name: positional[0] || null, frame: flags.frame ?? null }, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // Shared render setup: engine / device / samples / resolution as bpy, from PARAMS.
@@ -1603,21 +1605,20 @@ commands.render = async (args, ctx) => {
   const animation = !!flags.animation;
   const out = resolve(flags.out || join(process.cwd(), animation ? 'preview.mp4' : 'preview.png'));
   if (flags.threads !== undefined && !(Number.isInteger(Number(flags.threads)) && Number(flags.threads) > 0)) {
-    show({ ok: false, error: `invalid --threads: ${flags.threads} (a positive integer)` }, ctx); process.exit(1);
+    fail({ error: `invalid --threads: ${flags.threads} (a positive integer)` }, ctx);
   }
   const params = {
     out, frame: flags.frame ?? null, frames: flags.frames || null, fps: flags.fps ?? null,
     res: flags.res || null, engine: flags.engine || null, device: flags.device || null,
     samples: flags.samples ?? null, denoise: flags.denoise ?? null, threads: flags.threads ?? null,
   };
-  if ((flags.resume || flags.manifest) && !flags.batch) { show({ ok: false, error: '--manifest and --resume require --batch' }, ctx); process.exit(1); }
-  if (flags.accept === true) { show({ ok: false, error: 'missing value for --accept' }, ctx); process.exit(1); }
+  if ((flags.resume || flags.manifest) && !flags.batch) fail({ error: '--manifest and --resume require --batch' }, ctx);
+  if (flags.accept === true) fail({ error: 'missing value for --accept' }, ctx);
   if (flags.accept !== undefined && !flags.batch) {
-    if (flags.accept === true) { show({ ok: false, error: 'missing value for --accept (acceptance JSON path)' }, ctx); process.exit(1); }
+    if (flags.accept === true) fail({ error: 'missing value for --accept (acceptance JSON path)' }, ctx);
     const gate = runAcceptance(flags.accept, { blend: flags.blend, receipt: flags.receipt, flags });
     if (!gate.ok) {
-      show({ ok: false, error: `render blocked: ${gate.error}`, acceptance: gate.result?.acceptance || null, receipt: gate.receipt || null }, ctx);
-      process.exit(1);
+      fail({ error: `render blocked: ${gate.error}`, acceptance: gate.result?.acceptance || null, receipt: gate.receipt || null }, ctx);
     }
   }
   const still = `${SOURCE_DEPENDENCIES}${RENDER_SETUP}
@@ -1710,21 +1711,20 @@ result["duration_ms"] = int((time.time() - _t) * 1000)
 _meta(result, sc)`;
   const body = animation ? anim : still;
   if (flags.detach) {
-    if (flags.batch) { show({ ok: false, error: '--detach and --batch cannot be combined; detach one render at a time' }, ctx); process.exit(1); }
+    if (flags.batch) fail({ error: '--detach and --batch cannot be combined; detach one render at a time' }, ctx);
     // Frame range, when given, lets `job status` report percent done.
     let frames = null;
     const fm = String(flags.frames || '').match(/^\s*(-?\d+)\s*(?:\.\.|:)\s*(-?\d+)\s*$/);
     if (fm) frames = [Number(fm[1]), Number(fm[2])];
     else if (/^\s*-?\d+\s*$/.test(String(flags.frames || ''))) frames = [Number(flags.frames), Number(flags.frames)];
     const r = runBlenderDetached(body, { blend: flags.blend, params, flags }, { command: animation ? 'render --animation' : 'render', out, frames });
-    show(r, ctx); if (!r.ok) process.exit(1);
+    reply(r, ctx);
     return;
   }
   if (flags.batch) {
     const files = globFiles(String(flags.batch));
     if (!files.length) {
-      show({ ok: false, error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
-      process.exit(1);
+      fail({ error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
     }
     // In batch mode --out names a DIRECTORY; each .blend renders to <stem>.<ext>.
     const outDir = resolve(flags.out || process.cwd());
@@ -1750,11 +1750,11 @@ _meta(result, sc)`;
         return r;
       }, batchOptions(flags, 'render', { ...params, out: outDir, animation, ext }));
     } catch (e) { agg = { ok: false, error: e.message }; }
-    show(agg, ctx); if (!agg.ok) process.exit(1);
+    reply(agg, ctx);
     return;
   }
   const r = runBlender(body, { blend: flags.blend, params, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `blender-cli import <file | polyhaven:id>` — pull an asset into the scene:
@@ -1767,15 +1767,14 @@ commands.import = async (args, ctx) => {
   if (flags.batch) {
     const files = globFiles(String(flags.batch));
     if (!files.length) {
-      show({ ok: false, error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
-      process.exit(1);
+      fail({ error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
     }
     const r = runBlender(MULTI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { files, allow_empty: !!flags['allow-empty'] }, flags });
     if (r.ok && r.result?.imported_batch?.failed > 0) {
       r.ok = false;
       r.error = `${r.result.imported_batch.failed} of ${r.result.imported_batch.total} file(s) failed to import`;
     }
-    show(r, ctx); if (!r.ok) process.exit(1);
+    reply(r, ctx);
     return;
   }
   if (src && src.startsWith('polyhaven:')) {
@@ -1784,12 +1783,11 @@ commands.import = async (args, ctx) => {
     let dl;
     const maps = typeof flags.maps === 'string' ? flags.maps.split(',').map(x => x.trim()).filter(Boolean) : null;
     if (flags.maps === true || (flags.maps !== undefined && !maps?.length)) {
-      show({ ok: false, error: 'missing value for --maps (comma-separated map names)' }, ctx); process.exit(1);
+      fail({ error: 'missing value for --maps (comma-separated map names)' }, ctx);
     }
     try { dl = await polyhavenDownload(assetId, { type: flags.type, res, maps }); }
     catch (e) {
-      show({ ok: false, error: e.message, hint: 'check the asset id on https://polyhaven.com, --type hdri|texture|model, --res 1k|2k|4k' }, ctx);
-      process.exit(1);
+      fail({ error: e.message, hint: 'check the asset id on https://polyhaven.com, --type hdri|texture|model, --res 1k|2k|4k' }, ctx);
     }
     const r = dl.kind === 'hdri' ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: dl.main, pack: !!flags.pack }, flags })
       : dl.kind === 'model' ? runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: dl.main, pack: !!flags.pack, allow_empty: !!flags['allow-empty'] }, flags })
@@ -1797,18 +1795,17 @@ commands.import = async (args, ctx) => {
     if (r.ok) r.result = { ...(r.result || {}), asset_id: assetId, asset_type: dl.kind, resolution: res,
       files: dl.files.length, cached: dl.cached, cache_dir: dl.cache_dir, provenance: dl.provenance,
       selected_maps: maps, packed: !!flags.pack };
-    show(r, ctx); if (!r.ok) process.exit(1);
+    reply(r, ctx);
     return;
   }
   if (!src || !existsSync(src)) {
-    show({ ok: false, error: `asset file not found: ${src || '(none given)'}`, usage: 'blender-cli import <asset-file | polyhaven:id> [--blend f] [--save f] [--type hdri|texture|model] [--res 1k|2k|4k]' }, ctx);
-    process.exit(1);
+    fail({ error: `asset file not found: ${src || '(none given)'}`, usage: 'blender-cli import <asset-file | polyhaven:id> [--blend f] [--save f] [--type hdri|texture|model] [--res 1k|2k|4k]' }, ctx);
   }
   const localExt = src.toLowerCase().split('.').pop();
   const r = (flags.type === 'hdri' || ['hdr', 'exr'].includes(localExt))
     ? runBlender(HDRI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { path: resolve(src), pack: !!flags.pack }, flags })
     : runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: resolve(src), pack: !!flags.pack, allow_empty: !!flags['allow-empty'] }, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `blender-cli generate "<prompt>"` — text-to-3D via Meshy (MESHY_API_KEY),
@@ -1821,21 +1818,21 @@ commands.generate = async (args, ctx) => {
   const prompt = positional.join(' ').trim();
   const usage = 'blender-cli generate "<prompt>" | generate --image ref.png [--out asset.glb] [--import] [--blend f] [--save f] [--wait sec]';
   const imageArg = typeof flags.image === 'string' ? flags.image : null;
-  if (flags.image === true) { show({ ok: false, error: 'missing value for --image', usage }, ctx); process.exit(1); }
-  if (!prompt && !imageArg) { show({ ok: false, error: 'missing prompt (or --image <file>)', usage }, ctx); process.exit(1); }
+  if (flags.image === true) fail({ error: 'missing value for --image', usage }, ctx);
+  if (!prompt && !imageArg) fail({ error: 'missing prompt (or --image <file>)', usage }, ctx);
   const backend = flags.backend || 'meshy';
-  if (backend !== 'meshy') { show({ ok: false, error: `unknown backend: ${backend}`, hint: 'available: meshy' }, ctx); process.exit(1); }
+  if (backend !== 'meshy') fail({ error: `unknown backend: ${backend}`, hint: 'available: meshy' }, ctx);
   let imagePath = null, imageMime = null;
   if (imageArg) {
     imagePath = resolve(imageArg);
-    if (!existsSync(imagePath)) { show({ ok: false, error: `image not found: ${imageArg}` }, ctx); process.exit(1); }
+    if (!existsSync(imagePath)) fail({ error: `image not found: ${imageArg}` }, ctx);
     imageMime = IMAGE_MIME[imagePath.toLowerCase().split('.').pop()];
-    if (!imageMime) { show({ ok: false, error: `unsupported image format: ${imagePath.split('.').pop()}`, hint: `use one of: ${Object.keys(IMAGE_MIME).join(', ')}` }, ctx); process.exit(1); }
+    if (!imageMime) fail({ error: `unsupported image format: ${imagePath.split('.').pop()}`, hint: `use one of: ${Object.keys(IMAGE_MIME).join(', ')}` }, ctx);
   }
   const apiKey = env.MESHY_API_KEY || process.env.MESHY_API_KEY;
-  if (!apiKey) { show({ ok: false, error: 'MESHY_API_KEY not set', hint: 'export MESHY_API_KEY=<key from https://www.meshy.ai> and retry' }, ctx); process.exit(1); }
+  if (!apiKey) fail({ error: 'MESHY_API_KEY not set', hint: 'export MESHY_API_KEY=<key from https://www.meshy.ai> and retry' }, ctx);
   const waitSec = flags.wait !== undefined ? Number(flags.wait) : 300;
-  if (!Number.isFinite(waitSec) || waitSec <= 0) { show({ ok: false, error: `invalid --wait: ${flags.wait} (whole seconds)` }, ctx); process.exit(1); }
+  if (!Number.isFinite(waitSec) || waitSec <= 0) fail({ error: `invalid --wait: ${flags.wait} (whole seconds)` }, ctx);
   const stem = imagePath ? basename(imagePath).replace(/\.[^.]+$/, '') : prompt.replace(/\W+/g, '_').slice(0, 40);
   const out = resolve(flags.out || `${stem || 'generated'}.glb`);
   const base = env.MESHY_API_BASE || process.env.MESHY_API_BASE || 'https://api.meshy.ai';
@@ -1881,13 +1878,12 @@ commands.generate = async (args, ctx) => {
     if (flags.import) {
       const r = runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: out }, flags });
       r.result = { ...(r.result || {}), ...meta };
-      show(r, ctx); if (!r.ok) process.exit(1);
+      reply(r, ctx);
       return;
     }
     show({ ok: true, result: meta, ms: Date.now() - t0 }, ctx);
   } catch (e) {
-    show({ ok: false, error: e.message, ...(taskId ? { task_id: taskId } : {}) }, ctx);
-    process.exit(1);
+    fail({ error: e.message, ...(taskId ? { task_id: taskId } : {}) }, ctx);
   }
 };
 
@@ -2083,9 +2079,9 @@ commands.export = async (args, ctx) => {
   const outArg = positional[0];
   const verify = !flags['no-verify'];
   const animFlag = flags.animations === undefined ? 'on' : String(flags.animations).toLowerCase();
-  if (!['on', 'off'].includes(animFlag)) { show({ ok: false, error: `invalid --animations: ${flags.animations} (use on|off)` }, ctx); process.exit(1); }
+  if (!['on', 'off'].includes(animFlag)) fail({ error: `invalid --animations: ${flags.animations} (use on|off)` }, ctx);
   const animations = animFlag === 'on';
-  if (flags.strict && !verify) { show({ ok: false, error: '--strict requires readback verification; remove --no-verify' }, ctx); process.exit(1); }
+  if (flags.strict && !verify) fail({ error: '--strict requires readback verification; remove --no-verify' }, ctx);
   let options = {};
   try {
     if (flags.options !== undefined) {
@@ -2095,7 +2091,7 @@ commands.export = async (args, ctx) => {
       if (!options || typeof options !== 'object' || Array.isArray(options)) throw new Error('--options must be a JSON object or @file.json');
     }
     if ((flags.resume || flags.manifest) && !flags.batch) throw new Error('--manifest and --resume require --batch');
-  } catch (e) { show({ ok: false, error: e.message }, ctx); process.exit(1); }
+  } catch (e) { fail({ error: e.message }, ctx); }
   const finish = r => {
     try { if (r.ok) exportBundleProof(r.result); }
     catch (e) { r.ok = false; r.error = `export artifact verification failed: ${e.message}`; }
@@ -2110,14 +2106,12 @@ commands.export = async (args, ctx) => {
   if (flags.batch) {
     const files = globFiles(String(flags.batch));
     if (!files.length) {
-      show({ ok: false, error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
-      process.exit(1);
+      fail({ error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
     }
     // In batch mode the positional is the output DIRECTORY and --format the extension.
     const fmt = String(flags.format || '').replace(/^\./, '');
     if (!fmt) {
-      show({ ok: false, error: 'missing --format in batch mode', usage: 'blender-cli export <out-dir> --batch "blends/*.blend" --format glb' }, ctx);
-      process.exit(1);
+      fail({ error: 'missing --format in batch mode', usage: 'blender-cli export <out-dir> --batch "blends/*.blend" --format glb' }, ctx);
     }
     const outDir = resolve(outArg || process.cwd());
     let agg;
@@ -2129,15 +2123,14 @@ commands.export = async (args, ctx) => {
         params: { out: join(outDir, `${stemOf(f)}.${fmt}`), selected: !!flags.selected, verify, animations, options }, flags })),
         batchOptions(flags, 'export', { outDir, fmt, verify, animations, options }));
     } catch (e) { agg = { ok: false, error: e.message }; }
-    show(agg, ctx); if (!agg.ok) process.exit(1);
+    reply(agg, ctx);
     return;
   }
   if (!outArg) {
-    show({ ok: false, error: 'missing output path', usage: 'blender-cli export <out.glb|obj|fbx|stl|ply|usd> [--blend f] [--selected] [--no-verify] [--strict]' }, ctx);
-    process.exit(1);
+    fail({ error: 'missing output path', usage: 'blender-cli export <out.glb|obj|fbx|stl|ply|usd> [--blend f] [--selected] [--no-verify] [--strict]' }, ctx);
   }
   const r = finish(runBlender(EXPORT_BODY, { blend: flags.blend, params: { out: resolve(outArg), selected: !!flags.selected, verify, animations, options }, flags }));
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `blender-cli verify [--blend f]` — lint the scene before you spend a render on
@@ -2293,10 +2286,10 @@ commands.verify = async (args, ctx) => {
   const { flags } = fdn.parseArgs(args, ['blend', 'tolerance', 'fail-on', ...COMMON_FLAGS]);
   const failOn = flags['fail-on'] || 'error';
   if (!['error', 'warn', 'none'].includes(failOn)) {
-    show({ ok: false, error: `invalid --fail-on: ${failOn} (use error|warn|none)` }, ctx); process.exit(1);
+    fail({ error: `invalid --fail-on: ${failOn} (use error|warn|none)` }, ctx);
   }
   if (flags.tolerance !== undefined && !(Number(flags.tolerance) >= 0)) {
-    show({ ok: false, error: `invalid --tolerance: ${flags.tolerance} (a non-negative number, e.g. 0.001)` }, ctx); process.exit(1);
+    fail({ error: `invalid --tolerance: ${flags.tolerance} (a non-negative number, e.g. 0.001)` }, ctx);
   }
   const r = runBlender(VERIFY_BODY, { blend: flags.blend, params: { tolerance: flags.tolerance ?? null, no_mesh: !!flags['no-mesh'] }, flags });
   const v = r?.result?.verified;
@@ -2304,7 +2297,7 @@ commands.verify = async (args, ctx) => {
     const bad = failOn === 'warn' ? v.errors + v.warnings : v.errors;
     if (bad > 0) { r.ok = false; r.error = `scene verify failed: ${v.errors} error(s), ${v.warnings} warning(s) (--fail-on ${failOn})`; }
   }
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `blender-cli new <name> [--save path.blend]` — scaffold a clean project with camera + light.
@@ -2326,7 +2319,7 @@ light.location = (4.0, 1.0, 6.0)
 sc.render.resolution_x = 1920; sc.render.resolution_y = 1080
 result["scaffolded"] = {"scene": sc.name, "camera": cam.name, "light": light.name}`;
   const r = runBlender(body, { save, params: { name }, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `blender-cli snapshot` — look at what you built without spending a real render.
@@ -2443,7 +2436,7 @@ if blank: result["snapshot"]["warnings"] = ["blank view(s): " + ", ".join(blank)
 commands.snapshot = async (args, ctx) => {
   const { flags } = fdn.parseArgs(args, ['blend', 'out', 'views', 'res', 'shading', 'frame', 'bg', ...COMMON_FLAGS]);
   const out = resolve(flags.out || join(process.cwd(), 'snapshot.png'));
-  if (flags.res !== undefined && !/^\d+x\d+$/i.test(String(flags.res))) { show({ ok: false, error: `invalid --res: ${flags.res} (WxH, e.g. 512x384)` }, ctx); process.exit(1); }
+  if (flags.res !== undefined && !/^\d+x\d+$/i.test(String(flags.res))) fail({ error: `invalid --res: ${flags.res} (WxH, e.g. 512x384)` }, ctx);
   const tmp = mkdtempSync(join(tmpdir(), 'blender-cli-snap-'));
   let r;
   try {
@@ -2452,7 +2445,7 @@ commands.snapshot = async (args, ctx) => {
       frame: flags.frame ?? null, bg: flags.bg ?? null,
     }, flags });
   } finally { rmSync(tmp, { recursive: true, force: true }); }
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // Declarative acceptance composes the existing scene verifier and optional
@@ -2591,9 +2584,9 @@ function runAcceptance(specArg, { blend, receipt, flags, snapshotOut }) {
 commands.accept = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, ['blend', 'receipt', ...COMMON_FLAGS]);
   const spec = positional[0];
-  if (!spec) { show({ ok: false, error: 'missing acceptance spec', usage: 'blender-cli accept <acceptance.json> --blend scene.blend [--receipt result.json]' }, ctx); process.exit(1); }
+  if (!spec) fail({ error: 'missing acceptance spec', usage: 'blender-cli accept <acceptance.json> --blend scene.blend [--receipt result.json]' }, ctx);
   const r = runAcceptance(spec, { blend: flags.blend, receipt: flags.receipt, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // --- Parametric verbs: add / keyframe / material ----------------------------
@@ -2813,9 +2806,9 @@ commands.add = async (args, ctx) => {
         ...(flags.color !== undefined ? { color: flags.color } : {}) }];
     }
     for (const op of ops) if (typeof op.color === 'string') op.color = parseColor(op.color);
-  } catch (e) { show({ ok: false, error: e.message, usage }, ctx); process.exit(1); }
+  } catch (e) { fail({ error: e.message, usage }, ctx); }
   const r = runBlender(ADD_BODY, { blend: flags.blend, save: flags.save, params: { ops }, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 commands.keyframe = async (args, ctx) => {
@@ -2833,16 +2826,16 @@ commands.keyframe = async (args, ctx) => {
       if (!op.object) throw new Error('every keyframe needs an object name');
       if (op.frame === undefined || op.frame === true || !Number.isInteger(Number(op.frame))) throw new Error(`invalid frame: ${op.frame} (an integer)`);
     }
-  } catch (e) { show({ ok: false, error: e.message, usage }, ctx); process.exit(1); }
+  } catch (e) { fail({ error: e.message, usage }, ctx); }
   const params = { ops, extend: !flags['no-extend'], interp: typeof flags.interp === 'string' ? flags.interp : null };
   const r = runBlender(KEYFRAME_BODY, { blend: flags.blend, save: flags.save, params, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 commands.material = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'name', 'color', 'roughness', 'metallic', 'alpha', 'emission', 'emission-strength', ...COMMON_FLAGS]);
   const usage = 'blender-cli material <object> [--name M] [--color r,g,b|#hex] [--roughness 0..1] [--metallic 0..1] [--alpha 0..1] [--emission r,g,b] [--emission-strength N] [--blend f] [--save f]';
-  if (!positional[0]) { show({ ok: false, error: 'missing object name', usage }, ctx); process.exit(1); }
+  if (!positional[0]) fail({ error: 'missing object name', usage }, ctx);
   const params = { object: positional[0], name: typeof flags.name === 'string' ? flags.name : null };
   try {
     if (flags.color !== undefined) params.color = parseColor(flags.color);
@@ -2853,9 +2846,9 @@ commands.material = async (args, ctx) => {
       if (flags[flag] === true || !Number.isFinite(n)) throw new Error(`invalid --${flag}: ${flags[flag]} (a number)`);
       params[key] = n;
     }
-  } catch (e) { show({ ok: false, error: e.message, usage }, ctx); process.exit(1); }
+  } catch (e) { fail({ error: e.message, usage }, ctx); }
   const r = runBlender(MATERIAL_BODY, { blend: flags.blend, save: flags.save, params, flags });
-  show(r, ctx); if (!r.ok) process.exit(1);
+  reply(r, ctx);
 };
 
 // `blender-cli addon` — list / enable / disable / install add-ons and extensions
@@ -2926,13 +2919,13 @@ commands.addon = async (args, ctx) => {
   let r;
   if (sub === 'list') r = runBlender(ADDON_LIST_BODY, { params: { all: !!flags.all }, flags });
   else if (sub === 'enable' || sub === 'disable') {
-    if (!target) { show({ ok: false, error: `missing module name for addon ${sub}`, usage }, ctx); process.exit(1); }
+    if (!target) fail({ error: `missing module name for addon ${sub}`, usage }, ctx);
     r = runBlender(ADDON_TOGGLE_BODY, { params: { module: target, action: sub, persist }, flags });
   } else if (sub === 'install') {
-    if (!target || !existsSync(target)) { show({ ok: false, error: `add-on file not found: ${target || '(none given)'}`, usage }, ctx); process.exit(1); }
+    if (!target || !existsSync(target)) fail({ error: `add-on file not found: ${target || '(none given)'}`, usage }, ctx);
     r = runBlender(ADDON_INSTALL_BODY, { params: { file: resolve(target), enable: !!flags.enable, persist }, flags });
-  } else { show({ ok: false, error: `unknown addon subcommand: ${sub || '(none)'}`, usage }, ctx); process.exit(1); }
-  show(r, ctx); if (!r.ok) process.exit(1);
+  } else fail({ error: `unknown addon subcommand: ${sub || '(none)'}`, usage }, ctx);
+  reply(r, ctx);
 };
 
 // `blender-cli job` — the other half of --detach.
@@ -2947,13 +2940,13 @@ commands.job = async (args, ctx) => {
     show({ ok: true, jobs, running: jobs.filter(j => j.status === 'running').length, dir: JOBS_DIR }, ctx);
     return;
   }
-  if (sub === 'status') { const r = jobStatus(id); show(r, ctx); if (!r.ok) process.exit(1); return; }
+  if (sub === 'status') { const r = jobStatus(id); reply(r, ctx); return; }
   if (sub === 'wait') {
-    if (!readJob(id)) { show({ ok: false, error: `unknown job: ${id || '(none given)'}`, hint: 'blender-cli job list' }, ctx); process.exit(1); }
+    if (!readJob(id)) fail({ error: `unknown job: ${id || '(none given)'}`, hint: 'blender-cli job list' }, ctx);
     const limit = flags.timeout !== undefined ? Number(flags.timeout) : 0;
-    if (flags.timeout !== undefined && !(limit > 0)) { show({ ok: false, error: `invalid --timeout: ${flags.timeout} (whole seconds)` }, ctx); process.exit(1); }
+    if (flags.timeout !== undefined && !(limit > 0)) fail({ error: `invalid --timeout: ${flags.timeout} (whole seconds)` }, ctx);
     const stallAfter = flags['stall-after'] !== undefined ? Number(flags['stall-after']) : 0;
-    if (flags['stall-after'] !== undefined && !(stallAfter > 0)) { show({ ok: false, error: `invalid --stall-after: ${flags['stall-after']} (whole seconds)` }, ctx); process.exit(1); }
+    if (flags['stall-after'] !== undefined && !(stallAfter > 0)) fail({ error: `invalid --stall-after: ${flags['stall-after']} (whole seconds)` }, ctx);
     const poll = Math.max(0.2, Number(flags.poll) || 2);
     const deadline = limit ? Date.now() + limit * 1000 : Infinity;
     let r = jobStatus(id);
@@ -2965,7 +2958,7 @@ commands.job = async (args, ctx) => {
       r.ok = false; r.stalled = true;
       r.error = `no output from Blender for ${r.idle_s}s (left running; blender-cli job cancel ${id} stops it)`;
     } else if (r.status === 'running') { r.ok = false; r.error = `still running after ${limit}s (left running; blender-cli job cancel ${id} stops it)`; }
-    show(r, ctx); if (!r.ok) process.exit(1);
+    reply(r, ctx);
     return;
   }
   if (sub === 'cancel') {
@@ -2982,7 +2975,7 @@ commands.job = async (args, ctx) => {
     show({ ok: true, job: id, status: job.status, was: before.status }, ctx);
     return;
   }
-  show({ ok: false, error: `unknown job subcommand: ${sub || '(none)'}`, usage }, ctx); process.exit(1);
+  fail({ error: `unknown job subcommand: ${sub || '(none)'}`, usage }, ctx);
 };
 
 // --- Machine-readable command manifest ---------------------------------------
@@ -3130,7 +3123,7 @@ commands.install = (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args);
   const sub = positional[0] || 'all';
   if (!['codex', 'claude', 'all', 'doctor'].includes(sub)) {
-    show({ ok: false, error: `unknown install target: ${sub}`, usage: 'blender-cli install codex|claude|all|doctor [--global]' }, ctx); process.exit(1);
+    fail({ error: `unknown install target: ${sub}`, usage: 'blender-cli install codex|claude|all|doctor [--global]' }, ctx);
   }
   const root = flags.global ? homedir() : process.cwd();
   const targets = {
@@ -3163,22 +3156,22 @@ commands.schema = (args, ctx) => {
   const { flags } = fdn.parseArgs(args, ['out', 'command', 'effects']);
   let specs = COMMAND_SPECS;
   if (flags.command !== undefined) {
-    if (flags.command === true) { show({ ok: false, error: 'missing value for --command' }, ctx); process.exit(1); }
+    if (flags.command === true) fail({ error: 'missing value for --command' }, ctx);
     const names = String(flags.command).split(',').map(x => x.trim()).filter(Boolean);
     const unknown = names.filter(n => !COMMAND_SPECS.some(c => c.name === n));
-    if (unknown.length) { show({ ok: false, error: `unknown command(s): ${unknown.join(', ')}` }, ctx); process.exit(1); }
+    if (unknown.length) fail({ error: `unknown command(s): ${unknown.join(', ')}` }, ctx);
     specs = specs.filter(c => names.includes(c.name));
   }
   if (flags.effects !== undefined) {
-    if (flags.effects === true) { show({ ok: false, error: 'missing value for --effects' }, ctx); process.exit(1); }
+    if (flags.effects === true) fail({ error: 'missing value for --effects' }, ctx);
     const effects = String(flags.effects).split(',').map(x => x.trim()).filter(Boolean);
     const unknown = effects.filter(e => !EFFECTS[e]);
-    if (unknown.length) { show({ ok: false, error: `unknown effect(s): ${unknown.join(', ')}` }, ctx); process.exit(1); }
+    if (unknown.length) fail({ error: `unknown effect(s): ${unknown.join(', ')}` }, ctx);
     specs = specs.filter(c => c.effects.some(e => effects.includes(e)));
   }
   const manifest = buildManifest(specs);
-  if (flags.out === true) { show({ ok: false, error: 'missing value for --out' }, ctx); process.exit(1); }
-  if (flags.skill && flags.compact) { show({ ok: false, error: '--compact emits JSON and cannot be combined with --skill' }, ctx); process.exit(1); }
+  if (flags.out === true) fail({ error: 'missing value for --out' }, ctx);
+  if (flags.skill && flags.compact) fail({ error: '--compact emits JSON and cannot be combined with --skill' }, ctx);
   if (flags.skill) {
     const md = renderSkill(manifest);
     if (flags.out) { writeFileSync(resolve(flags.out), md); show({ ok: true, written: resolve(flags.out), bytes: Buffer.byteLength(md), format: 'skill' }, ctx); }
