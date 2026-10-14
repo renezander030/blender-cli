@@ -944,15 +944,20 @@ else:
 // Deliberately a tiny matcher, not a glob library: `*` and `?` in the LAST path
 // segment only, no `**`. Quote the pattern so it reaches us unexpanded — an
 // unquoted glob is expanded by the shell before the CLI ever sees it.
-function globFiles(pattern) {
-  const abs = resolve(pattern);
+// A pattern that matches nothing is refused with the quoting hint, since that
+// is almost always the shell having expanded it first.
+function batchFiles(pattern, ctx) {
+  const abs = resolve(String(pattern));
   const dir = dirname(abs);
   const pat = basename(abs);
-  if (!/[*?]/.test(pat)) return existsSync(abs) ? [abs] : [];
-  const rx = new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
-  let entries;
-  try { entries = readdirSync(dir); } catch { return []; }
-  return entries.filter(f => rx.test(f)).sort().map(f => join(dir, f));
+  let files = [];
+  if (!/[*?]/.test(pat)) files = existsSync(abs) ? [abs] : [];
+  else {
+    const rx = new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+    try { files = readdirSync(dir).filter(f => rx.test(f)).sort().map(f => join(dir, f)); } catch { /* unreadable dir: no match */ }
+  }
+  if (!files.length) fail({ error: `--batch matched no files: ${pattern}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
+  return files;
 }
 
 // Every item runs; a failure is recorded against its file and the run continues.
@@ -1624,7 +1629,6 @@ commands.render = async (args, ctx) => {
   if ((flags.resume || flags.manifest) && !flags.batch) fail({ error: '--manifest and --resume require --batch' }, ctx);
   if (flags.accept === true) fail({ error: 'missing value for --accept' }, ctx);
   if (flags.accept !== undefined && !flags.batch) {
-    if (flags.accept === true) fail({ error: 'missing value for --accept (acceptance JSON path)' }, ctx);
     const gate = runAcceptance(flags.accept, { blend: flags.blend, receipt: flags.receipt, flags });
     if (!gate.ok) {
       fail({ error: `render blocked: ${gate.error}`, acceptance: gate.result?.acceptance || null, receipt: gate.receipt || null }, ctx);
@@ -1724,10 +1728,7 @@ _meta(result, sc)`;
     return;
   }
   if (flags.batch) {
-    const files = globFiles(String(flags.batch));
-    if (!files.length) {
-      fail({ error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
-    }
+    const files = batchFiles(flags.batch, ctx);
     // In batch mode --out names a DIRECTORY; each .blend renders to <stem>.<ext>.
     const outDir = resolve(flags.out || process.cwd());
     const ext = String(flags.ext || (animation ? 'mp4' : 'png')).replace(/^\./, '');
@@ -1767,10 +1768,7 @@ commands.import = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'type', 'res', 'maps', 'batch', ...COMMON_FLAGS]);
   const src = positional[0];
   if (flags.batch) {
-    const files = globFiles(String(flags.batch));
-    if (!files.length) {
-      fail({ error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
-    }
+    const files = batchFiles(flags.batch, ctx);
     const r = runBlender(MULTI_IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { files, allow_empty: !!flags['allow-empty'] }, flags });
     if (r.ok && r.result?.imported_batch?.failed > 0) {
       r.ok = false;
@@ -2102,10 +2100,7 @@ commands.export = async (args, ctx) => {
     return r;
   };
   if (flags.batch) {
-    const files = globFiles(String(flags.batch));
-    if (!files.length) {
-      fail({ error: `--batch matched no files: ${flags.batch}`, hint: 'quote the pattern so the shell does not expand it first; * and ? are supported in the last path segment, ** is not' }, ctx);
-    }
+    const files = batchFiles(flags.batch, ctx);
     // In batch mode the positional is the output DIRECTORY and --format the extension.
     const fmt = String(flags.format || '').replace(/^\./, '');
     if (!fmt) {
