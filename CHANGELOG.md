@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.8.1 (2026-10-14)
+
+The 120-check suite passes on Blender 4.3.2 and 5.2.0.
 
 ### Fixed
 
@@ -12,8 +14,9 @@
 
 - `schema` lists every value flag the commands accept, including those of `add`, `keyframe`, `material`, `render` (`--res`, `--fps`) and `generate` (`--backend`).
 - Error replies for `exec`, `run`, `material`, `addon` and `generate` carry the same usage line as `schema` and `help`.
+- Command handlers share one output path, one batch resolver, one artifact hash helper and one atomic file write. A failed receipt, manifest or cache write now removes its temporary file.
 
-## 0.8.0 (unreleased)
+## 0.8.0 (2026-10-10)
 
 The 117-check suite passes on Blender 4.3.2 and 5.2.0.
 
