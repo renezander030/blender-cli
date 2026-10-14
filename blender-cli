@@ -37,14 +37,18 @@ function fileProof(path) {
   return { path: p, bytes, sha256: hash.digest('hex') };
 }
 
-function writeJsonAtomic(path, value) {
+// Readers never see a half-written file: write a sibling temp file, rename it
+// over the target, and leave no temp file behind if either step fails.
+function writeFileAtomic(path, data, options) {
   const p = resolve(path);
   mkdirSync(dirname(p), { recursive: true });
   const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
-  renameSync(tmp, p);
+  try { writeFileSync(tmp, data, options); renameSync(tmp, p); }
+  finally { rmSync(tmp, { force: true }); }
   return p;
 }
+
+const writeJsonAtomic = (path, value) => writeFileAtomic(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
 
 // Flags every Blender-running command accepts: --blender <path>, --timeout <sec>
 // and --addons a,b (enable add-ons/extensions for this one call).
@@ -570,10 +574,7 @@ async function downloadTo(url, dest, expectedSize = null, { force = false } = {}
   if (expectedSize != null && buf.length !== Number(expectedSize)) {
     throw new Error(`download size mismatch for ${url}: expected ${expectedSize} bytes, got ${buf.length}`);
   }
-  mkdirSync(dirname(dest), { recursive: true });
-  const tmp = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  try { writeFileSync(tmp, buf); renameSync(tmp, dest); }
-  finally { rmSync(tmp, { force: true }); }
+  writeFileAtomic(dest, buf);
   return { cached: false, bytes: buf.length };
 }
 
