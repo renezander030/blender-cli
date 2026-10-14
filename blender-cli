@@ -633,6 +633,13 @@ const SHA256_HELPER = `def _sha256_file(path):
     return h.hexdigest()
 `;
 
+// Blender 5.x splits output into media types and accepts a still or video format only once the
+// matching type is set; older builds have no media_type and take any format directly.
+const OUTPUT_FORMAT_HELPER = `def _set_file_format(settings, fmt):
+    if hasattr(settings, "media_type"): settings.media_type = "VIDEO" if fmt == "FFMPEG" else "IMAGE"
+    settings.file_format = fmt
+`;
+
 const SOURCE_DEPENDENCIES = `result["source_dependencies"] = sorted(set(
     bpy.path.abspath(x.filepath, library=getattr(x, "library", None))
     for x in list(bpy.data.images) + list(bpy.data.libraries)
@@ -1275,7 +1282,6 @@ result["addons_enabled"] = sorted(a.module for a in bpy.context.preferences.addo
 // --safe refuses to run code that trips the AST gate (BLENDER_CLI_SAFE=1 makes
 // it the default; --unsafe overrides). --timeout <sec> kills a hung Blender.
 const EXEC_FLAGS = ['blend', 'save', 'expect-sha256', ...COMMON_FLAGS];
-const EXEC_USAGE = 'blender-cli exec "<bpy code>" [--blend f.blend] [--save out.blend] [--check] [--safe] [--expect-sha256 hex] [--diff] [--detach] [--addons a,b] [--timeout sec]';
 async function execBody(body, args, ctx) {
   const { flags } = fdn.parseArgs(args, EXEC_FLAGS);
   const safeMode = flags.unsafe ? false
@@ -1350,13 +1356,13 @@ result["checked_only"] = True`;
 }
 commands.exec = async (args, ctx) => {
   const { positional } = fdn.parseArgs(args, EXEC_FLAGS);
-  if (!positional.length) fail({ error: 'missing bpy code', usage: EXEC_USAGE }, ctx);
+  if (!positional.length) fail({ error: 'missing bpy code', usage: usageOf('exec') }, ctx);
   await execBody(positional.join(' '), args, ctx);
 };
 commands.run = async (args, ctx) => {
   const { positional } = fdn.parseArgs(args, EXEC_FLAGS);
   const file = positional[0];
-  if (!file || !existsSync(file)) fail({ error: `script not found: ${file || '(none given)'}`, usage: 'blender-cli run <script.py> [--blend f.blend] [--save out.blend] [--check] [--safe] [--detach] [--timeout sec]' }, ctx);
+  if (!file || !existsSync(file)) fail({ error: `script not found: ${file || '(none given)'}`, usage: usageOf('run') }, ctx);
   await execBody(readFileSync(file, 'utf8'), args, ctx);
 };
 
@@ -1638,7 +1644,7 @@ commands.render = async (args, ctx) => {
       fail({ error: `render blocked: ${gate.error}`, acceptance: gate.result?.acceptance || null, receipt: gate.receipt || null }, ctx);
     }
   }
-  const still = `${SHA256_HELPER}${SOURCE_DEPENDENCIES}${RENDER_SETUP}
+  const still = `${SHA256_HELPER}${OUTPUT_FORMAT_HELPER}${SOURCE_DEPENDENCIES}${RENDER_SETUP}
 if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
 if not any(o.type == "CAMERA" for o in sc.objects):
     raise RuntimeError("no camera in scene to render from")
@@ -1648,7 +1654,7 @@ ext = base.rsplit(".", 1)[-1].lower() if "." in base else ""
 fmt = {"png": "PNG", "jpg": "JPEG", "jpeg": "JPEG", "exr": "OPEN_EXR", "tif": "TIFF", "tiff": "TIFF", "bmp": "BMP", "webp": "WEBP"}.get(ext)
 if fmt is None:
     out = out + ".png"; fmt = "PNG"
-sc.render.image_settings.file_format = fmt
+_set_file_format(sc.render.image_settings, fmt)
 sc.render.use_file_extension = False
 sc.render.filepath = out
 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -1661,7 +1667,7 @@ result["bytes"] = os.path.getsize(out)
 if result["bytes"] <= 0: raise RuntimeError("render reported success but produced an empty artifact: " + out)
 result["artifact"] = {"path": out, "kind": "image", "bytes": result["bytes"], "sha256": _sha256_file(out), "format": fmt}
 _meta(result, sc)`;
-  const anim = `${SHA256_HELPER}${SOURCE_DEPENDENCIES}${RENDER_SETUP}
+  const anim = `${SHA256_HELPER}${OUTPUT_FORMAT_HELPER}${SOURCE_DEPENDENCIES}${RENDER_SETUP}
 import glob as _glob
 import hashlib as _hashlib
 if not any(o.type == "CAMERA" for o in sc.objects):
@@ -1673,7 +1679,7 @@ video = out.lower().endswith((".mp4", ".mov", ".webm"))
 if video:
     fmts = [i.identifier for i in bpy.types.ImageFormatSettings.bl_rna.properties["file_format"].enum_items]
     if "FFMPEG" not in fmts: raise RuntimeError("this Blender build has no FFMPEG video support; render a PNG sequence instead (--out frames/)")
-    sc.render.image_settings.file_format = "FFMPEG"
+    _set_file_format(sc.render.image_settings, "FFMPEG")
     sc.render.ffmpeg.format = {"mp4": "MPEG4", "mov": "QUICKTIME", "webm": "WEBM"}[out.rsplit(".", 1)[-1].lower()]
     sc.render.ffmpeg.codec = "WEBM" if sc.render.ffmpeg.format == "WEBM" else "H264"
     stem = os.path.join(d, "__bcli_anim__")
@@ -1693,7 +1699,7 @@ else:
     prefix = out[:-4] + "_" if out.lower().endswith(".png") else os.path.join(out, "frame_")
     os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
     for f in _glob.glob(_glob.escape(prefix) + "*"): os.remove(f)
-    sc.render.image_settings.file_format = "PNG"
+    _set_file_format(sc.render.image_settings, "PNG")
     sc.render.filepath = prefix
     _t = time.time()
     bpy.ops.render.render(animation=True)
@@ -1820,7 +1826,7 @@ const IMAGE_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', we
 commands.generate = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, ['out', 'backend', 'blend', 'save', 'wait', 'image', ...COMMON_FLAGS]);
   const prompt = positional.join(' ').trim();
-  const usage = 'blender-cli generate "<prompt>" | generate --image ref.png [--out asset.glb] [--import] [--blend f] [--save f] [--wait sec]';
+  const usage = usageOf('generate');
   const imageArg = typeof flags.image === 'string' ? flags.image : null;
   if (flags.image === true) fail({ error: 'missing value for --image', usage }, ctx);
   if (!prompt && !imageArg) fail({ error: 'missing prompt (or --image <file>)', usage }, ctx);
@@ -1880,7 +1886,7 @@ commands.generate = async (args, ctx) => {
     await downloadTo(task.model_urls.glb, out, null, { force: true });
     const meta = { generated: out, backend, mode: imagePath ? 'image-to-3d' : 'text-to-3d', task_id: taskId, status: task.status, bytes: statSync(out).size, ...(imagePath ? { source_image: imagePath } : {}) };
     if (flags.import) {
-      const r = runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: out }, flags });
+      const r = runBlender(IMPORT_BODY, { blend: flags.blend, save: flags.save, params: { file: out, pack: !!flags.pack, allow_empty: !!flags['allow-empty'] }, flags });
       r.result = { ...(r.result || {}), ...meta };
       reply(r, ctx);
       return;
@@ -2325,7 +2331,7 @@ result["scaffolded"] = {"scene": sc.name, "camera": cam.name, "light": light.nam
 // of pixels the geometry actually occupies, via the alpha channel), the
 // occupied bounding box and mean luminance, so an agent can tell "framed and
 // visible" from "blank" or "off to one side" without an image model in the loop.
-const SNAPSHOT_BODY = `import math as _m
+const SNAPSHOT_BODY = `${OUTPUT_FORMAT_HELPER}import math as _m
 from mathutils import Vector, Euler
 import numpy as np
 sc = bpy.context.scene
@@ -2348,7 +2354,7 @@ sc.render.engine = "BLENDER_WORKBENCH"
 sc.render.resolution_x, sc.render.resolution_y = W, H
 sc.render.resolution_percentage = 100
 sc.render.film_transparent = True
-sc.render.image_settings.file_format = "PNG"
+_set_file_format(sc.render.image_settings, "PNG")
 sc.render.image_settings.color_mode = "RGBA"
 sc.render.use_file_extension = False
 sh = sc.display.shading
@@ -2433,7 +2439,7 @@ if blank: result["snapshot"]["warnings"] = ["blank view(s): " + ", ".join(blank)
 commands.snapshot = async (args, ctx) => {
   const { flags } = fdn.parseArgs(args, ['blend', 'out', 'views', 'res', 'shading', 'frame', 'bg', ...COMMON_FLAGS]);
   const out = resolve(flags.out || join(process.cwd(), 'snapshot.png'));
-  if (flags.res !== undefined && !/^\d+x\d+$/i.test(String(flags.res))) fail({ error: `invalid --res: ${flags.res} (WxH, e.g. 512x384)` }, ctx);
+  if (flags.res !== undefined && !/^[1-9]\d*x[1-9]\d*$/i.test(String(flags.res))) fail({ error: `invalid --res: ${flags.res} (WxH, e.g. 512x384)` }, ctx);
   const tmp = mkdtempSync(join(tmpdir(), 'blender-cli-snap-'));
   let r;
   try {
@@ -2831,7 +2837,7 @@ commands.keyframe = async (args, ctx) => {
 
 commands.material = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, ['blend', 'save', 'name', 'color', 'roughness', 'metallic', 'alpha', 'emission', 'emission-strength', ...COMMON_FLAGS]);
-  const usage = 'blender-cli material <object> [--name M] [--color r,g,b|#hex] [--roughness 0..1] [--metallic 0..1] [--alpha 0..1] [--emission r,g,b] [--emission-strength N] [--blend f] [--save f]';
+  const usage = usageOf('material');
   if (!positional[0]) fail({ error: 'missing object name', usage }, ctx);
   const params = { object: positional[0], name: typeof flags.name === 'string' ? flags.name : null };
   try {
@@ -2911,7 +2917,7 @@ result["enabled"] = bool(module and module in bpy.context.preferences.addons)`;
 commands.addon = async (args, ctx) => {
   const { flags, positional } = fdn.parseArgs(args, COMMON_FLAGS);
   const [sub, target] = positional;
-  const usage = 'blender-cli addon list [--all] | enable <module> [--no-persist] | disable <module> [--no-persist] | install <file.py|.zip> [--enable] [--no-persist]';
+  const usage = usageOf('addon');
   const persist = !flags['no-persist'];
   let r;
   if (sub === 'list') r = runBlender(ADDON_LIST_BODY, { params: { all: !!flags.all }, flags });
@@ -2990,6 +2996,8 @@ const EFFECTS = {
   process: 'starts or stops a background Blender process',
 };
 const FL = (name, value, doc) => ({ name, value, doc });
+// The spec's usage line is the one error replies show, so the two cannot drift.
+const usageOf = name => COMMAND_SPECS.find(c => c.name === name).usage;
 const COMMON_SPEC_FLAGS = [
   FL('blender', 'path', 'Blender binary to use (else BLENDER_BIN, then auto-detect)'),
   FL('timeout', 'sec', 'kill Blender after this many seconds'),
@@ -3011,10 +3019,10 @@ const COMMAND_SPECS = [
     summary: 'Locate Blender, verify headless bpy, report version support, import/export formats, engines, GPU devices, enabled add-ons and API generation. Run first.' },
   { name: 'new', effects: ['files'], usage: 'blender-cli new <name> [--save f.blend]', flags: [FL('save', 'path', 'where to write (default ./<name>.blend)')],
     summary: 'Scaffold a clean project (camera + key light + 1080p) and save it.' },
-  { name: 'exec', effects: ['code', 'scene'], usage: 'blender-cli exec "<bpy>" [--blend f] [--save f] [--check] [--safe] [--expect-sha256 hex] [--diff] [--detach]',
+  { name: 'exec', effects: ['code', 'scene'], usage: 'blender-cli exec "<bpy>" [--blend f] [--save f] [--check] [--safe] [--unsafe] [--expect-sha256 hex] [--diff] [--detach]',
     flags: [...BLEND_FLAGS, FL('check', null, 'compile + flag risky calls + version-specific API drift + code_sha256, execute nothing'), FL('safe', null, 'refuse code that trips the AST gate; imports resolve against an allowlist'), FL('unsafe', null, 'override BLENDER_CLI_SAFE=1'), FL('expect-sha256', 'hex', 'run only if the code hashes to this value (from --check)'), DIFF_FLAG, FL('detach', null, 'run as a background job; poll with job status')],
     summary: 'Run agent-authored bpy; keys set on result come back as JSON. A failure on a known API move carries api_drift hints; --expect-sha256 binds a run to reviewed code.' },
-  { name: 'run', effects: ['code', 'scene'], usage: 'blender-cli run <script.py> [--blend f] [--save f] [--check] [--safe] [--expect-sha256 hex] [--diff] [--detach]', flags: [...BLEND_FLAGS, FL('check', null, 'as exec'), FL('safe', null, 'as exec'), FL('expect-sha256', 'hex', 'as exec'), DIFF_FLAG, FL('detach', null, 'as exec')],
+  { name: 'run', effects: ['code', 'scene'], usage: 'blender-cli run <script.py> [--blend f] [--save f] [--check] [--safe] [--unsafe] [--expect-sha256 hex] [--diff] [--detach]', flags: [...BLEND_FLAGS, FL('check', null, 'as exec'), FL('safe', null, 'as exec'), FL('unsafe', null, 'as exec'), FL('expect-sha256', 'hex', 'as exec'), DIFF_FLAG, FL('detach', null, 'as exec')],
     summary: 'Same as exec, from a .py file.' },
   { name: 'scene', effects: ['read'], usage: 'blender-cli scene [--blend f]', flags: [BLEND_FLAGS[0]],
     summary: 'Dump objects (transforms, F-curve and keyframe counts), frame range, engine, resolution, materials, cameras and lights as JSON.' },
@@ -3033,30 +3041,31 @@ const COMMAND_SPECS = [
   { name: 'accept', effects: ['read', 'files'], usage: 'blender-cli accept <acceptance.json> --blend scene.blend [--receipt result.json]',
     flags: [BLEND_FLAGS[0], FL('receipt', 'path', 'atomic JSON receipt (default beside the spec)')],
     summary: 'Apply declarative object/type/frame/verify/snapshot requirements and write a receipt bound to the spec, source scene and visual evidence hashes.' },
-  { name: 'add', effects: ['scene'], usage: 'blender-cli add <kind> [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z] [--type T] [--energy N] [--color c] [--text T] [--blend f] [--save f] | add --json "[...]"',
-    flags: [...BLEND_FLAGS, FL('json', 'list', 'batch of ops in one launch: [{"what":"cube","name":"A","at":[0,0,1]}]'), DIFF_FLAG],
+  { name: 'add', effects: ['scene'], usage: 'blender-cli add <kind> [--name N] [--at x,y,z] [--rot x,y,z] [--size N] [--scale x,y,z] [--look-at x,y,z] [--type T] [--energy N] [--color c] [--text T] [--lens mm] [--blend f] [--save f] | add --json "[...]"',
+    flags: [...BLEND_FLAGS, FL('name', 'N', 'object name'), FL('at', 'x,y,z', 'location'), FL('rot', 'x,y,z', 'rotation in degrees'), FL('size', 'N', 'primitive size'), FL('scale', 'x,y,z', 'scale'), FL('look-at', 'x,y,z', 'aim a camera or light at this point'), FL('type', 'T', 'light type: sun | point | spot | area'), FL('energy', 'N', 'light power'), FL('color', 'r,g,b|#hex', 'light or object colour'), FL('text', 'T', 'body of a text object'), FL('lens', 'mm', 'camera focal length'), FL('json', 'list', 'batch of ops in one launch: [{"what":"cube","name":"A","at":[0,0,1]}]'), DIFF_FLAG],
     summary: 'Add a primitive (cube sphere icosphere plane cylinder cone torus monkey), camera, light, empty or text by name, in one Blender launch; returns the resulting objects.' },
   { name: 'keyframe', effects: ['scene'], usage: 'blender-cli keyframe <object> --frame N [--prop location|rotation|scale|<data.path>] [--value x,y,z] [--interp linear|bezier|constant] [--no-extend] [--blend f] [--save f] | keyframe --json "[...]"',
-    flags: [...BLEND_FLAGS, FL('json', 'list', 'batch of keys in one launch'), FL('no-extend', null, 'do not grow the scene frame range to the keyed frame'), DIFF_FLAG],
+    flags: [...BLEND_FLAGS, FL('frame', 'N', 'frame to key'), FL('prop', 'name', 'location | rotation | scale | a data path (default location)'), FL('value', 'x,y,z', 'value to set before keying'), FL('interp', 'mode', 'linear | bezier | constant'), FL('json', 'list', 'batch of keys in one launch'), FL('no-extend', null, 'do not grow the scene frame range to the keyed frame'), DIFF_FLAG],
     summary: 'Set a property and insert a keyframe on a named object (rotation in degrees); works on both legacy and slotted actions; returns per-object keyframe counts.' },
-  { name: 'material', effects: ['scene'], usage: 'blender-cli material <object> [--name M] [--color r,g,b|#hex] [--roughness x] [--metallic x] [--alpha x] [--emission c] [--emission-strength x] [--blend f] [--save f]', flags: [...BLEND_FLAGS, DIFF_FLAG],
+  { name: 'material', effects: ['scene'], usage: 'blender-cli material <object> [--name M] [--color r,g,b|#hex] [--roughness 0..1] [--metallic 0..1] [--alpha 0..1] [--emission r,g,b|#hex] [--emission-strength N] [--blend f] [--save f]',
+    flags: [...BLEND_FLAGS, FL('name', 'M', 'material name (created if missing)'), FL('color', 'r,g,b|#hex', 'base colour'), FL('roughness', '0..1', 'roughness'), FL('metallic', '0..1', 'metallic'), FL('alpha', '0..1', 'alpha'), FL('emission', 'r,g,b|#hex', 'emission colour'), FL('emission-strength', 'N', 'emission strength'), DIFF_FLAG],
     summary: 'Create or update a Principled BSDF material and assign it to a named object, using the 4.0+ socket names with fallbacks.' },
   { name: 'import', effects: ['scene', 'network'], usage: 'blender-cli import <file | polyhaven:id> [--blend f] [--save f] [--type hdri|texture|model] [--res 1k|2k|4k] [--maps a,b] [--pack] | import --batch "assets/*.glb"',
     flags: [...BLEND_FLAGS, FL('type', 'kind', 'Poly Haven asset kind'), FL('res', 'res', 'Poly Haven resolution'), FL('maps', 'a,b', 'download only matching texture maps'), FL('pack', null, 'pack downloaded images into the saved .blend'), FL('batch', 'glob', 'gather many files into one scene'), FL('allow-empty', null, 'accept a file that adds no objects'), DIFF_FLAG],
     summary: 'Import local assets or fetch Poly Haven assets; reports the arrived objects with their parents and roots, and fails when an import adds nothing.' },
-  { name: 'generate', effects: ['network', 'files', 'scene'], usage: 'blender-cli generate "<prompt>" | generate --image ref.png [--out f.glb] [--import] [--wait sec]',
-    flags: [...BLEND_FLAGS, FL('out', 'path', 'GLB to write'), FL('import', null, 'import the result into the scene'), FL('wait', 'sec', 'polling budget'), FL('image', 'path', 'image-to-3D reference')],
+  { name: 'generate', effects: ['network', 'files', 'scene'], usage: 'blender-cli generate "<prompt>" | generate --image ref.png [--out f.glb] [--import] [--pack] [--allow-empty] [--blend f] [--save f] [--wait sec] [--backend meshy]',
+    flags: [...BLEND_FLAGS, FL('out', 'path', 'GLB to write'), FL('import', null, 'import the result into the scene'), FL('pack', null, 'with --import: pack images into the saved .blend'), FL('allow-empty', null, 'with --import: accept a file that adds no objects'), FL('wait', 'sec', 'polling budget'), FL('image', 'path', 'image-to-3D reference'), FL('backend', 'name', 'generation backend (meshy)')],
     summary: 'Text- or image-to-3D via Meshy (needs MESHY_API_KEY); downloads the GLB, optionally imports it.' },
   { name: 'export', effects: ['files'], usage: 'blender-cli export <out.glb|gltf|obj|fbx|stl|ply|usd> [--blend f] [--selected] [--no-verify] [--strict] [--animations on|off] | export <dir> --batch "b/*.blend" --format glb',
     flags: [BLEND_FLAGS[0], FL('selected', null, 'selected objects only'), FL('no-verify', null, 'skip the readback census'), FL('strict', null, 'degraded fidelity is exit 1'), FL('animations', 'on|off', 'write animation (default on)'), FL('batch', 'glob', 'one export per .blend'), FL('format', 'ext', 'batch output format'), FL('options', 'json|@file', 'format-specific options validated against live operator RNA'), FL('manifest', 'path', 'save batch progress and artifact proofs'), FL('resume', null, 'skip matching successful manifest entries')],
     summary: 'Write the scene out, hash it, read it back and report format-aware fidelity across geometry, material slots, UVs, colour-channel variance, shape keys and animation.' },
   { name: 'render', effects: ['files', 'process'], usage: 'blender-cli render [--blend f] --out p.png [--frame N] [--res WxH] [--engine E] [--device auto|cpu|cuda|optix|metal|hip|oneapi] [--threads N] [--samples N] [--denoise on|off] [--detach] | render --animation --out clip.mp4 [--frames 1..48] [--fps 24] | render --batch "shots/*.blend" --out dir/',
-    flags: [BLEND_FLAGS[0], FL('out', 'path', 'image, video or sequence target'), FL('animation', null, 'render the frame range'), FL('frames', 'a..b', 'frame range'), FL('frame', 'N', 'still frame'), FL('engine', 'name', 'cycles | eevee | workbench'), FL('device', 'name', 'auto picks the best GPU backend, else cpu'), FL('threads', 'N', 'fixed CPU thread count'), FL('samples', 'N', 'render samples'), FL('denoise', 'on|off', 'Cycles denoising'), FL('accept', 'spec', 'block unless the acceptance spec passes'), FL('receipt', 'path', 'acceptance receipt path'), FL('detach', null, 'background job; poll with job status'), FL('batch', 'glob', 'one render per .blend'), FL('ext', 'ext', 'batch output extension'), FL('manifest', 'path', 'save batch progress and artifact proofs'), FL('resume', null, 'skip matching successful manifest entries')],
+    flags: [BLEND_FLAGS[0], FL('out', 'path', 'image, video or sequence target'), FL('animation', null, 'render the frame range'), FL('frames', 'a..b', 'frame range'), FL('frame', 'N', 'still frame'), FL('res', 'WxH', 'output resolution'), FL('fps', 'N', 'animation frame rate'), FL('engine', 'name', 'cycles | eevee | workbench'), FL('device', 'name', 'auto picks the best GPU backend, else cpu'), FL('threads', 'N', 'fixed CPU thread count'), FL('samples', 'N', 'render samples'), FL('denoise', 'on|off', 'Cycles denoising'), FL('accept', 'spec', 'block unless the acceptance spec passes'), FL('receipt', 'path', 'acceptance receipt path'), FL('detach', null, 'background job; poll with job status'), FL('batch', 'glob', 'one render per .blend'), FL('ext', 'ext', 'batch output extension'), FL('manifest', 'path', 'save batch progress and artifact proofs'), FL('resume', null, 'skip matching successful manifest entries')],
     summary: 'Render a still, video or sequence with non-empty artifact proof, SHA-256, actual format/codec metadata, and an optional fail-closed acceptance gate.' },
   { name: 'job', effects: ['process'], usage: 'blender-cli job list | status <id> | wait <id> [--timeout sec] [--poll sec] [--stall-after sec] | cancel <id>',
     flags: [FL('timeout', 'sec', 'wait: give up (job keeps running)'), FL('poll', 'sec', 'wait: poll interval'), FL('stall-after', 'sec', 'wait: give up when Blender has written no output for this long')],
     summary: 'Inspect, wait for or cancel detached renders/execs; status reports frames done (and percent when the range is known), seconds since the last output, or the final result.' },
-  { name: 'addon', effects: ['prefs', 'files'], usage: 'blender-cli addon list [--all] | enable <module> [--no-persist] | disable <module> | install <file.py|.zip> [--enable]',
+  { name: 'addon', effects: ['prefs', 'files'], usage: 'blender-cli addon list [--all] | enable <module> [--no-persist] | disable <module> [--no-persist] | install <file.py|.zip> [--enable] [--no-persist]',
     flags: [FL('all', null, 'list disabled modules too'), FL('no-persist', null, 'do not write user preferences'), FL('enable', null, 'install: enable after installing')],
     summary: 'List, enable, disable or install add-ons and extensions headless; enable persists to user preferences unless --no-persist.' },
   { name: 'install', effects: ['files'], usage: 'blender-cli install codex|claude|all|doctor [--global]', flags: [FL('global', null, 'install under the user home instead of the current repository')],
@@ -3194,7 +3203,7 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
   exec "<bpy>"  [--blend f] [--save f] [--check] [--safe] [--expect-sha256 hex] [--diff] [--detach]
                                run agent-authored bpy; result[...] keys -> JSON back
   run <script.py> [...]        same, from a .py file
-  diff <before.blend> <after.blend> [--frame N] [--fail-on-change]
+  diff <before.blend> <after.blend> [--frame N] [--tolerance N] [--fail-on-change]
   assets search [query] [--type hdri|texture|model] [--category name]
   receipt verify <receipt.json>
   scene [--blend f]            dump objects / frame range / engine / materials / keyframes as JSON
@@ -3244,7 +3253,7 @@ Usage: blender-cli <command> [args] [--blender <path>] [--timeout <sec>] [--addo
   job list | status <id> | wait <id> [--timeout sec] [--stall-after sec] | cancel <id>
                                the other half of --detach: progress (frames done / percent),
                                then the final result once Blender is finished
-  addon list [--all] | enable <module> [--no-persist] | disable <module> | install <file.py|.zip> [--enable]
+  addon list [--all] | enable <module> [--no-persist] | disable <module> [--no-persist] | install <file.py|.zip> [--enable] [--no-persist]
                                add-ons and extensions, headless; enable persists to user prefs
   install codex|claude|all|doctor [--global]  idempotently install or verify generated agent skills
   schema [--command a,b] [--effects read,files] [--compact] [--skill] [--out f]

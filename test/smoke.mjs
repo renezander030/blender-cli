@@ -11,7 +11,7 @@
 // matrix in the CLI: a version is only listed there once this suite passes on it.
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, readdirSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, readdirSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -204,6 +204,15 @@ check('render --animation writes a PNG sequence', () => {
     '--engine', 'eevee', '--samples', '4', '--res', '96x72']);
   if (!r.json?.ok) return r.json?.error || 'not ok';
   return r.json.result?.frame_files === 3 ? true : `expected 3 frames, got ${r.json.result?.frame_files}`;
+});
+
+check('render --animation writes an MP4', () => {
+  const out = join(WORK, 'clip.mp4');
+  const r = cli(['render', '--blend', BLEND, '--out', out, '--animation', '--frames', '1..3',
+    '--engine', 'workbench', '--res', '96x72']);
+  if (!r.json?.ok) return r.json?.error || 'not ok';
+  const a = r.json.result?.artifact;
+  return a?.kind === 'video' && a.container === 'MPEG4' && statSync(out).size === a.bytes ? true : `artifact ${JSON.stringify(a)}`;
 });
 
 // --- export fidelity ---------------------------------------------------------
@@ -631,6 +640,25 @@ check('snapshot on a scene with nothing visible fails loudly', () => {
 check('snapshot rejects an unknown view', () => {
   const r = cli(['snapshot', '--blend', BLEND, '--out', join(WORK, 'v.png'), '--views', 'front,sideways']);
   return r.code !== 0 && /unknown view/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+check('snapshot rejects a zero resolution', () => {
+  const r = cli(['snapshot', '--blend', BLEND, '--out', join(WORK, 'z.png'), '--res', '0x0']);
+  return r.code !== 0 && /invalid --res/.test(r.json?.error || '') ? true : `unexpected: ${r.json?.error}`;
+});
+
+check('schema lists every value flag a command parses, and errors show its usage line', () => {
+  const s = cli(['schema']).json;
+  const flags = name => s.commands.find(c => c.name === name).flags.map(f => f.name);
+  const want = { add: ['name', 'at', 'rot', 'size', 'scale', 'look-at', 'type', 'energy', 'color', 'text', 'lens'],
+    keyframe: ['prop', 'frame', 'value', 'interp'], material: ['name', 'color', 'roughness', 'metallic', 'alpha', 'emission', 'emission-strength'],
+    generate: ['backend', 'pack', 'allow-empty'], render: ['fps', 'res'] };
+  for (const [cmd, names] of Object.entries(want)) {
+    const missing = names.filter(n => !flags(cmd).includes(n));
+    if (missing.length) return `${cmd} schema lacks ${missing.join(', ')}`;
+  }
+  const r = cli(['material']);
+  return r.json?.usage === s.commands.find(c => c.name === 'material').usage ? true : `usage ${r.json?.usage}`;
 });
 
 // --- 0.4.0: detached jobs -------------------------------------------------------

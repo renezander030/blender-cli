@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `render --animation --out clip.mp4|.mov|.webm` works on Blender 5.x, which only accepts a video format after the output is switched to video. Stills, sequences and `snapshot` also render from scenes saved with video output.
+- `generate --import` honours `--pack` and `--allow-empty`, as `import` does.
+- `snapshot --res` refuses a zero width or height.
+
+### Changed
+
+- `schema` lists every value flag the commands accept, including those of `add`, `keyframe`, `material`, `render` (`--res`, `--fps`) and `generate` (`--backend`).
+- Error replies for `exec`, `run`, `material`, `addon` and `generate` carry the same usage line as `schema` and `help`.
+
 ## 0.8.0 (unreleased)
 
 The 117-check suite passes on Blender 4.3.2 and 5.2.0.
