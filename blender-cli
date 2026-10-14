@@ -623,6 +623,15 @@ function checkReceipt(path) {
     ...(checks.some(x => !x.matched) ? { error: 'acceptance receipt artifacts changed or are missing' } : {}) };
 }
 
+// SHA-256 of an artifact file in 1 MiB chunks, for the bodies that report what they wrote.
+const SHA256_HELPER = `def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""): h.update(chunk)
+    return h.hexdigest()
+`;
+
 const SOURCE_DEPENDENCIES = `result["source_dependencies"] = sorted(set(
     bpy.path.abspath(x.filepath, library=getattr(x, "library", None))
     for x in list(bpy.data.images) + list(bpy.data.libraries)
@@ -1621,8 +1630,7 @@ commands.render = async (args, ctx) => {
       fail({ error: `render blocked: ${gate.error}`, acceptance: gate.result?.acceptance || null, receipt: gate.receipt || null }, ctx);
     }
   }
-  const still = `${SOURCE_DEPENDENCIES}${RENDER_SETUP}
-import hashlib as _hashlib
+  const still = `${SHA256_HELPER}${SOURCE_DEPENDENCIES}${RENDER_SETUP}
 if PARAMS.get("frame") is not None: sc.frame_set(int(PARAMS["frame"]))
 if not any(o.type == "CAMERA" for o in sc.objects):
     raise RuntimeError("no camera in scene to render from")
@@ -1643,12 +1651,9 @@ result["frame"] = sc.frame_current
 result["duration_ms"] = int((time.time() - _t) * 1000)
 result["bytes"] = os.path.getsize(out)
 if result["bytes"] <= 0: raise RuntimeError("render reported success but produced an empty artifact: " + out)
-_h = _hashlib.sha256()
-with open(out, "rb") as _f:
-    for _chunk in iter(lambda: _f.read(1024 * 1024), b""): _h.update(_chunk)
-result["artifact"] = {"path": out, "kind": "image", "bytes": result["bytes"], "sha256": _h.hexdigest(), "format": fmt}
+result["artifact"] = {"path": out, "kind": "image", "bytes": result["bytes"], "sha256": _sha256_file(out), "format": fmt}
 _meta(result, sc)`;
-  const anim = `${SOURCE_DEPENDENCIES}${RENDER_SETUP}
+  const anim = `${SHA256_HELPER}${SOURCE_DEPENDENCIES}${RENDER_SETUP}
 import glob as _glob
 import hashlib as _hashlib
 if not any(o.type == "CAMERA" for o in sc.objects):
@@ -1674,10 +1679,7 @@ if video:
     result["rendered"] = out
     result["bytes"] = os.path.getsize(out)
     if result["bytes"] <= 0: raise RuntimeError("render reported success but produced an empty video: " + out)
-    _h = _hashlib.sha256()
-    with open(out, "rb") as _f:
-        for _chunk in iter(lambda: _f.read(1024 * 1024), b""): _h.update(_chunk)
-    result["artifact"] = {"path": out, "kind": "video", "bytes": result["bytes"], "sha256": _h.hexdigest(),
+    result["artifact"] = {"path": out, "kind": "video", "bytes": result["bytes"], "sha256": _sha256_file(out),
         "container": sc.render.ffmpeg.format, "codec": sc.render.ffmpeg.codec}
 else:
     prefix = out[:-4] + "_" if out.lower().endswith(".png") else os.path.join(out, "frame_")
@@ -1897,8 +1899,7 @@ commands.generate = async (args, ctx) => {
 // dimensions the target format actually carries, so STL is never accused of
 // losing materials it was never able to hold. --no-verify skips the readback,
 // --strict turns a degraded result into a non-zero exit.
-const EXPORT_BODY = `${FCURVES_HELPER}${SOURCE_DEPENDENCIES}import hashlib as _hashlib
-p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
+const EXPORT_BODY = `${FCURVES_HELPER}${SHA256_HELPER}${SOURCE_DEPENDENCIES}p = PARAMS["out"]; ext = p.lower().rsplit(".", 1)[-1]
 sel = bool(PARAMS.get("selected"))
 anim = PARAMS.get("animations") is not False
 os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
@@ -2041,11 +2042,8 @@ else: raise RuntimeError("unsupported format: ." + ext + " (glb gltf obj fbx stl
 
 _bytes = os.path.getsize(p)
 if _bytes <= 0: raise RuntimeError("export reported success but produced an empty artifact: " + p)
-_h = _hashlib.sha256()
-with open(p, "rb") as _f:
-    for _chunk in iter(lambda: _f.read(1024 * 1024), b""): _h.update(_chunk)
 result["exported"] = {"file": p, "format": ext, "bytes": _bytes, "objects": len(_scene_objs),
-    "artifact": {"path": p, "kind": "model", "format": ext, "bytes": _bytes, "sha256": _h.hexdigest()},
+    "artifact": {"path": p, "kind": "model", "format": ext, "bytes": _bytes, "sha256": _sha256_file(p)},
     "animation": {"objects": before["animated"], "keyframes": before["keyframes"], "exported": anim}}
 
 if PARAMS.get("verify"):
