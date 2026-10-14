@@ -1326,16 +1326,15 @@ result["checked_only"] = True`;
     reply(r, ctx);
     return;
   }
+  // --safe runs the gate body, which validates and then executes the agent code itself.
+  const [runBody, run] = safeMode
+    ? [SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __code__: body, __allowed_modules__: SAFE_ALLOWED_MODULES }, flags }]
+    : [body, { blend: flags.blend, save: flags.save, flags }];
   if (flags.detach) {
-    const r = safeMode
-      ? runBlenderDetached(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __code__: body, __allowed_modules__: SAFE_ALLOWED_MODULES }, flags }, { command: 'exec' })
-      : runBlenderDetached(body, { blend: flags.blend, save: flags.save, flags }, { command: 'exec' });
-    reply(r, ctx);
+    reply(runBlenderDetached(runBody, run, { command: 'exec' }), ctx);
     return;
   }
-  const r = safeMode
-    ? runBlender(SAFE_EXEC_BODY, { blend: flags.blend, save: flags.save, params: { __code__: body, __allowed_modules__: SAFE_ALLOWED_MODULES }, flags })
-    : runBlender(body, { blend: flags.blend, save: flags.save, flags });
+  const r = runBlender(runBody, run);
   // A failure on a known API move gets the matching hint appended, so the agent
   // learns the replacement from the error instead of from a second search.
   if (!r.ok && Array.isArray(r.bpy_version)) {
