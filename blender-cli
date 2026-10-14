@@ -645,8 +645,12 @@ function matchingProof(expected) {
   catch { return false; }
 }
 
+// The files a result declares as its output: an export bundle, a frame
+// sequence's members, or a single rendered file.
+const outputArtifacts = (result) => result?.exported?.artifacts || result?.artifact?.members || (result?.artifact ? [result.artifact] : []);
+
 function resultArtifacts(result) {
-  const artifacts = result?.exported?.artifacts || result?.artifact?.members || (result?.artifact ? [result.artifact] : []);
+  const artifacts = outputArtifacts(result);
   if (!artifacts.length) throw new Error('result has no verifiable output artifacts');
   return artifacts.map(a => fileProof(a.path));
 }
@@ -994,7 +998,7 @@ async function batchRun(files, fn, { manifest, resume = false, signature = null 
       }
     } catch (e) { r = { ...r, ok: false, error: e.message }; }
     if (manifest) {
-      const artifacts = r?.result?.exported?.artifacts || r?.result?.artifact?.members || (r?.result?.artifact ? [r.result.artifact] : []);
+      const artifacts = outputArtifacts(r?.result);
       const protectedPaths = [...artifacts.map(a => a.path), ...(r?.result?.source_dependencies || []), r?.receipt].filter(Boolean);
       if (protectedPaths.some(path => resolve(path) === resolve(manifest))) throw new Error('manifest must not overwrite an output artifact, acceptance receipt or input dependency');
     }
