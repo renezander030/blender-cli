@@ -16,6 +16,14 @@
 npm install -g blender-cli && blender-cli doctor
 ```
 
+## New in v0.8.1
+
+- **Video on Blender 5.x.** `render --animation --out clip.mp4` (and `.mov`, `.webm`) works on Blender 5.x as well as 4.x.
+- **Complete schema.** `schema` and the generated skill list every value flag the commands accept, and error replies carry the same usage line.
+- **Tighter inputs.** `generate --import` honours `--pack` and `--allow-empty`; `snapshot --res` refuses a zero size.
+
+Full details in the [changelog](./CHANGELOG.md).
+
 ## New in v0.8.0
 
 Nine additions make agent runs safer to approve, easier to review and easier to undo. The 117-check suite passes on Blender 4.3.2 and 5.2.0 LTS:
@@ -297,7 +305,7 @@ node test/release.mjs --blender /path/to/blender  # v0.7 regressions only
 node test/v080.mjs --blender /path/to/blender     # v0.8 checks only
 ```
 
-117 end-to-end checks (86 smoke checks, 20 v0.7 regressions and 11 v0.8 checks) run against a real Blender. The v0.8 checks run provider retries against a local stand-in server. Release regressions also inject an unavailable importer to check the failure contract and use a cached catalogue fixture to check asset discovery. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache. Separate publishing policy checks exercise the owner/commit review gate, version matching and registry conflicts without publishing.
+120 end-to-end checks (89 smoke checks, 20 v0.7 regressions and 11 v0.8 checks) run against a real Blender. The v0.8 checks run provider retries against a local stand-in server. Release regressions also inject an unavailable importer to check the failure contract and use a cached catalogue fixture to check asset discovery. A version only joins the tested matrix once this passes on it. The add-on checks run against isolated Blender preferences (`BLENDER_USER_RESOURCES`) and the job checks against a throwaway jobs directory, so the suite never touches the host's Blender configuration or job cache. Separate publishing policy checks exercise the owner/commit review gate, version matching and registry conflicts without publishing.
 
 ## License
 
