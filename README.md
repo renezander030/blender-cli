@@ -315,6 +315,6 @@ MIT. See [LICENSE](./LICENSE).
 
 ## Release publishing
 
-Pull requests run the complete suite against Blender 4.3.2 and 5.2.0. After the repository owner merges a `release/v<version>` PR and the checks pass on that exact `master` commit, the publishing workflow releases the matching npm package with provenance and creates a GitHub Release with the tarball and SHA-256 checksum. It requires an `NPM_TOKEN` repository secret with publishing access. Direct pushes and unsuccessful checks do not publish. Already published identical packages are reused; version or tag conflicts fail visibly.
+Pull requests run the complete suite against Blender 4.3.2 and 5.2.0. After the repository owner merges a `release/v<version>` PR and the checks pass on that exact `master` commit, the publishing workflow releases the matching npm package with provenance and creates a GitHub Release with the tarball and SHA-256 checksum. It publishes through npm trusted publishing (GitHub OIDC), so no npm token or repository secret is needed. Direct pushes and unsuccessful checks do not publish. Already published identical packages are reused; version or tag conflicts fail visibly.
 
 This repository distributes a JavaScript CLI on npm. It does not distribute a Python package or implement an MCP server.
