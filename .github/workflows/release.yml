@@ -79,12 +79,12 @@ jobs:
           const [pack] = JSON.parse(fs.readFileSync('pack.json', 'utf8'));
           fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_TARBALL=${pack.filename}\nRELEASE_INTEGRITY=${pack.integrity}\n`);
           JS
-      - name: Publish npm package with provenance
+      - name: npm 11 for trusted publishing
         if: steps.review.outputs.approved == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm install -g npm@11.12.1
+      - name: Publish npm package with provenance (trusted publishing, no token)
+        if: steps.review.outputs.approved == 'true'
         run: |
-          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN repository secret is required'; exit 1; }
           node --input-type=module <<'JS'
           import fs from 'node:fs';
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
