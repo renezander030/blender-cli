@@ -8,20 +8,22 @@ const gateMatch = workflow.match(/          script: \|\n((?:            .*\n)+)/
 assert.ok(gateMatch, 'release review gate script must exist');
 const gate = new (Object.getPrototypeOf(async function() {}).constructor)('context', 'github', 'core', gateMatch[1].replace(/^            /gm, ''));
 const owner = 'fixture-owner', sha = 'a'.repeat(40);
-const approved = { number: 4, merged_at: '2026-10-03T00:00:00Z', merge_commit_sha: sha,
-  base: { ref: 'master' }, merged_by: { login: owner }, head: { ref: 'release/v0.7.0' } };
-async function decision(prs) {
-  const outputs = {};
-  await gate({ repo: { owner, repo: 'fixture-repo' }, payload: { workflow_run: { head_sha: sha } } },
-    { rest: { repos: { listPullRequestsAssociatedWithCommit: async () => ({ data: prs }) },
-      pulls: { get: async ({ pull_number }) => ({ data: prs.find(p => p.number === pull_number) }) } } },
-    { setOutput: (k, v) => { outputs[k] = v; }, notice: () => {} });
-  return outputs;
+// a pushed v tag publishes only a commit that passed the Blender conformance suite on master
+async function decision(runs, ref = 'refs/tags/v0.7.0') {
+  const outputs = {}, asked = [];
+  let failed = '';
+  await gate({ repo: { owner, repo: 'fixture-repo' }, sha, ref },
+    { rest: { actions: { listWorkflowRuns: async (q) => { asked.push(q); return { data: { workflow_runs: runs } }; } } } },
+    { setOutput: (k, v) => { outputs[k] = v; }, setFailed: (m) => { failed = m; }, notice: () => {} });
+  return { outputs, failed, asked };
 }
-assert.deepEqual(await decision([approved]), { approved: 'true', version: '0.7.0' });
-for (const prs of [[], [{ ...approved, merged_at: null }], [{ ...approved, merged_by: { login: 'another-user' } }],
-  [{ ...approved, merge_commit_sha: 'b'.repeat(40) }], [{ ...approved, base: { ref: 'development' } }],
-  [{ ...approved, head: { ref: 'feature/new-work' } }]]) assert.equal((await decision(prs)).approved, 'false');
+const passed = await decision([{ id: 1, head_sha: sha, conclusion: 'success' }]);
+assert.deepEqual(passed.outputs, { approved: 'true', version: '0.7.0' });
+assert.equal(passed.failed, '');
+assert.deepEqual(passed.asked[0], { owner, repo: 'fixture-repo', workflow_id: 'ci.yml', head_sha: sha, event: 'push', branch: 'master', status: 'success' });
+const untested = await decision([]);
+assert.equal(untested.outputs.approved, 'false');
+assert.match(untested.failed, /No successful Blender conformance run on master/);
 const blocks = [...workflow.matchAll(/          node --input-type=module <<'JS'\n([\s\S]*?)\n          JS/g)].map(m => m[1].replace(/^          /gm, ''));
 assert.equal(blocks.length, 3, 'expected prepare, package metadata and registry-conflict scripts');
 const work = mkdtempSync(join(tmpdir(), 'bcli-release-policy-'));
@@ -47,4 +49,4 @@ try {
     assert.equal(existsSync(join(work, 'already-published')), shouldSkip);
   }
 } finally { rmSync(work, { recursive: true, force: true }); }
-console.log('Release publishing policy: owner/commit/branch checks, version matching and registry conflict checks passed.');
+console.log('Release publishing policy: tested-tag check, version matching and registry conflict checks passed.');
