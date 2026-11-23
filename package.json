@@ -1,6 +1,6 @@
 {
   "name": "blender-cli",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Drive Blender headless from your agent: scaffold, build, animate from natural language. JSON in, JSON out.",
   "type": "module",
   "bin": {

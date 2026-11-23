@@ -1,4 +1,10 @@
 # Changelog
+## 0.8.2 (2026-11-23)
+No change to the commands.
+### Changed
+- Releases publish to npm through trusted publishing from GitHub Actions; no npm token is stored anywhere.
+- A release is tagged first and published from that tag; a manual run of the Release workflow proves npm trust without publishing.
+
 
 ## 0.8.1 (2026-10-14)
 
